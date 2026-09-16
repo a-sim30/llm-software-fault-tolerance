@@ -7,26 +7,37 @@ Pipeline:
   2. Downsample each to 64 x 64, 128 x 128, 256 x 256 with anti-aliased
      averaging (area interpolation) so we simulate a realistic low-res
      acquisition rather than a naive stride subsample.
-  3. Super-resolve each downsampled image back to 512 x 512 with a family
-     of interpolation methods spanning increasing polynomial order:
-         Order 0  - Nearest neighbour
-         Order 1  - Bilinear
-         Order 2  - B-spline (quadratic)
-         Order 3  - Bicubic
-         Order 4  - B-spline (quartic)
-         Order 5  - B-spline (quintic)
-         Lanczos-4 - Windowed sinc (non-polynomial, listed for comparison)
-  4. Compute PSNR and SSIM of every super-resolved image against the
+  3. Super-resolve each downsampled image back to 512 x 512 with TWO
+     separately-labelled families of interpolation methods:
+
+       Family A - B-spline sweep (orders 0..5).
+         A single uniform algorithm where the polynomial order is the only
+         variable, so "does higher order help?" is a controlled experiment.
+
+       Family B - convolution kernels (as shipped in production libraries).
+         Nearest, bilinear, Keys bicubic (a = -0.75) and Lanczos-4.
+         These are what real image software actually uses.
+
+     Keeping the families apart matters: a Keys cubic kernel and a cubic
+     B-spline are both "third order" but are different operators, so mixing
+     them inside one order column makes the order axis uninterpretable.
+
+  4. Verify the two families agree at orders 0 and 1, where they are the
+     same mathematical operator. A mismatch there means the two code paths
+     disagree about grid alignment, which silently corrupts every spline
+     result - so the study checks its own geometry before collecting data.
+  5. Compute PSNR and SSIM of every super-resolved image against the
      original 512 x 512 grayscale reference.
-  5. Time each interpolation call (median of several runs to smooth noise).
-  6. Print consolidated results as pretty tables in the terminal and dump
-     CSV / Markdown copies for the report.
+  6. Time each interpolation call (median of several runs to smooth noise).
+  7. Print consolidated results as tables in the terminal and dump CSV /
+     Markdown copies for the report.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import math
 import statistics
 import sys
 import time
@@ -50,13 +61,25 @@ ORIGINAL_SIZE = 512
 DOWNSAMPLE_SIZES = (64, 128, 256)             # low-resolution targets
 TIMING_REPEATS = 5                            # runs per (image, method) cell
 
+SPLINE = "Spline"
+KERNEL = "Kernel"
+
+# Two implementations of the same operator may differ by one grey level from
+# integer vs float rounding; anything larger is a real geometry mismatch.
+AGREEMENT_TOLERANCE = 1.0
+
 
 @dataclass(frozen=True)
 class Method:
     """One interpolation method along with a printable label and a callable."""
-    order_label: str        # e.g. "0", "1", "3", "Lanczos"
-    name: str               # e.g. "Nearest neighbour"
+    family: str             # SPLINE or KERNEL
+    order_label: str        # "0".."5", or "L" for Lanczos
+    name: str               # e.g. "Bicubic (Keys, a=-0.75)"
     apply: Callable[[np.ndarray, int], np.ndarray]
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.family, self.order_label)
 
 
 # ---------------------------------------------------------------------------
@@ -74,22 +97,34 @@ def _spline_resize(order: int):
     """Return a resize callable that uses SciPy's spline interpolation."""
     def _resize(img: np.ndarray, target: int) -> np.ndarray:
         zoom = target / img.shape[0]
-        # mode='reflect' avoids dark borders that 'constant' would introduce.
+        # grid_mode=True selects cell-based (half-pixel-centre) coordinates,
+        # matching cv2.resize and the INTER_AREA downsample that built the
+        # reference. The default grid_mode=False maps (N-1)/(out-1) instead,
+        # which stretches the output by up to half a low-res pixel.
         return ndimage.zoom(img, zoom=zoom, order=order, mode="reflect",
-                            prefilter=True)
+                            prefilter=True, grid_mode=True)
     return _resize
 
 
 def build_methods() -> list[Method]:
     """The interpolation catalogue used throughout the study."""
     return [
-        Method("0", "Nearest neighbour (zeroth order)", _cv2_resize(cv2.INTER_NEAREST)),
-        Method("1", "Bilinear (first order)",           _cv2_resize(cv2.INTER_LINEAR)),
-        Method("2", "B-spline quadratic (second order)", _spline_resize(2)),
-        Method("3", "Bicubic (third order)",             _cv2_resize(cv2.INTER_CUBIC)),
-        Method("4", "B-spline quartic (fourth order)",   _spline_resize(4)),
-        Method("5", "B-spline quintic (fifth order)",    _spline_resize(5)),
-        Method("L", "Lanczos-4 (windowed sinc)",         _cv2_resize(cv2.INTER_LANCZOS4)),
+        # Family A - uniform B-spline sweep: order is the only variable.
+        Method(SPLINE, "0", "B-spline order 0 (nearest)",   _spline_resize(0)),
+        Method(SPLINE, "1", "B-spline order 1 (linear)",    _spline_resize(1)),
+        Method(SPLINE, "2", "B-spline order 2 (quadratic)", _spline_resize(2)),
+        Method(SPLINE, "3", "B-spline order 3 (cubic)",     _spline_resize(3)),
+        Method(SPLINE, "4", "B-spline order 4 (quartic)",   _spline_resize(4)),
+        Method(SPLINE, "5", "B-spline order 5 (quintic)",   _spline_resize(5)),
+        # Family B - convolution kernels as shipped by OpenCV.
+        Method(KERNEL, "0", "Nearest neighbour",
+               _cv2_resize(cv2.INTER_NEAREST)),
+        Method(KERNEL, "1", "Bilinear",
+               _cv2_resize(cv2.INTER_LINEAR)),
+        Method(KERNEL, "3", "Bicubic (Keys, a=-0.75)",
+               _cv2_resize(cv2.INTER_CUBIC)),
+        Method(KERNEL, "L", "Lanczos-4 (windowed sinc)",
+               _cv2_resize(cv2.INTER_LANCZOS4)),
     ]
 
 
@@ -116,6 +151,66 @@ def downsample(img: np.ndarray, target: int) -> np.ndarray:
     return cv2.resize(img, (target, target), interpolation=cv2.INTER_AREA)
 
 
+def to_uint8(arr: np.ndarray) -> np.ndarray:
+    return np.clip(arr, 0, 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Self-validation: the two families must agree where they coincide
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AgreementCheck:
+    order: str
+    input_size: int
+    max_abs_diff: float
+
+    @property
+    def passed(self) -> bool:
+        return self.max_abs_diff <= AGREEMENT_TOLERANCE
+
+
+def verify_family_agreement(original: np.ndarray,
+                            methods: list[Method]) -> list[AgreementCheck]:
+    """
+    Orders 0 and 1 are the same operator in both families (nearest is nearest;
+    a first-order B-spline is bilinear), so their outputs must be identical up
+    to rounding. This runs the real catalogue rather than a re-declaration, so
+    it keeps testing whatever build_methods() actually returns.
+    """
+    by_key = {m.key: m for m in methods}
+    checks: list[AgreementCheck] = []
+
+    for order in ("0", "1"):
+        spline = by_key.get((SPLINE, order))
+        kernel = by_key.get((KERNEL, order))
+        if spline is None or kernel is None:
+            continue
+        for lr_size in DOWNSAMPLE_SIZES:
+            low_res = downsample(original, lr_size)
+            a = to_uint8(spline.apply(low_res, ORIGINAL_SIZE)).astype(np.int16)
+            b = to_uint8(kernel.apply(low_res, ORIGINAL_SIZE)).astype(np.int16)
+            checks.append(AgreementCheck(order, lr_size,
+                                         float(np.max(np.abs(a - b)))))
+    return checks
+
+
+def print_agreement(checks: list[AgreementCheck]) -> bool:
+    headers = ["Order", "Input", "Spline vs Kernel (max |diff|)", "Result"]
+    body = [[c.order, f"{c.input_size}x{c.input_size}",
+             f"{c.max_abs_diff:.0f} grey levels",
+             "PASS" if c.passed else "FAIL"]
+            for c in checks]
+    print("\nGeometry self-check - the two families implement the same "
+          "operator at orders 0 and 1,")
+    print(f"so their outputs must match within {AGREEMENT_TOLERANCE:.0f} grey "
+          "level. A FAIL means the code paths")
+    print("disagree about grid alignment and every spline number is suspect.")
+    print(tabulate(body, headers=headers, tablefmt="fancy_grid",
+                   stralign="left", numalign="right"))
+    return all(c.passed for c in checks)
+
+
 # ---------------------------------------------------------------------------
 # Quality metrics + timing
 # ---------------------------------------------------------------------------
@@ -136,10 +231,12 @@ def timed_apply(method: Method, low_res: np.ndarray,
 
 def score(reference: np.ndarray, candidate: np.ndarray) -> tuple[float, float]:
     """PSNR (dB) and SSIM against the 512 x 512 grayscale reference."""
-    # Normalize dtypes / clamp to 8-bit range for a fair comparison.
     ref = reference.astype(np.float64)
-    cand = np.clip(candidate, 0, 255).astype(np.float64)
-    psnr_val = compute_psnr(ref, cand, data_range=255.0)
+    cand = candidate.astype(np.float64)
+    # An exact reconstruction gives MSE 0, so PSNR is legitimately infinite;
+    # errstate keeps that from printing a divide-by-zero warning.
+    with np.errstate(divide="ignore"):
+        psnr_val = compute_psnr(ref, cand, data_range=255.0)
     ssim_val = compute_ssim(ref, cand, data_range=255.0)
     return float(psnr_val), float(ssim_val)
 
@@ -151,6 +248,7 @@ def score(reference: np.ndarray, candidate: np.ndarray) -> tuple[float, float]:
 @dataclass
 class Row:
     image: str
+    family: str
     input_size: int
     factor: int
     order: str
@@ -177,18 +275,19 @@ class Study:
             for m in self.methods:
                 hr, runtime_ms = timed_apply(m, low_res, ORIGINAL_SIZE,
                                              TIMING_REPEATS)
-                # Force output dtype to uint8 so metrics compare like-for-like.
-                hr_u8 = np.clip(hr, 0, 255).astype(np.uint8)
+                hr_u8 = to_uint8(hr)
                 p, s = score(original, hr_u8)
 
                 if save_images:
-                    tag = m.order_label.replace(" ", "").lower()
-                    cv2.imwrite(str(out_dir /
-                                    f"{name}_sr_{lr_size}to512_o{tag}.png"),
-                                hr_u8)
+                    fam = m.family.lower()
+                    cv2.imwrite(
+                        str(out_dir / f"{name}_sr_{lr_size}to512_"
+                                      f"{fam}_o{m.order_label}.png"),
+                        hr_u8)
 
                 self.rows.append(Row(
                     image=name,
+                    family=m.family,
                     input_size=lr_size,
                     factor=factor,
                     order=m.order_label,
@@ -203,20 +302,40 @@ class Study:
 # Reporting
 # ---------------------------------------------------------------------------
 
-def _fmt_number(v: float, decimals: int = 3) -> str:
-    return f"{v:.{decimals}f}"
+def _fmt_psnr(v: float) -> str:
+    return "exact" if math.isinf(v) else f"{v:.2f}"
+
+
+def _mean_cell(values: list[float], decimals: int) -> str:
+    """Average a set of values, reporting exact reconstructions separately."""
+    finite = [v for v in values if math.isfinite(v)]
+    n_exact = len(values) - len(finite)
+    if not finite:
+        return f"exact ({n_exact}/{len(values)})"
+    mean = sum(finite) / len(finite)
+    if n_exact:
+        return f"{mean:.{decimals}f} (+{n_exact} exact)"
+    return f"{mean:.{decimals}f}"
+
+
+def _ordered_keys(rows: list[Row]) -> list[tuple[str, str]]:
+    keys: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for r in rows:
+        k = (r.family, r.order)
+        if k not in seen:
+            seen.add(k)
+            keys.append(k)
+    return keys
 
 
 def _per_image_table(rows: list[Row], image: str) -> str:
-    """Long-form table for one image: order x input size, with metrics."""
-    headers = ["Order", "Method", "Input", "Factor",
+    headers = ["Family", "Order", "Method", "Input", "Factor",
                "PSNR (dB)", "SSIM", "Runtime (ms)"]
     body = [
-        [r.order, r.method, f"{r.input_size}x{r.input_size}",
-         f"{r.factor}x",
-         _fmt_number(r.psnr_db, 2),
-         _fmt_number(r.ssim, 4),
-         _fmt_number(r.runtime_ms, 3)]
+        [r.family, r.order, r.method, f"{r.input_size}x{r.input_size}",
+         f"{r.factor}x", _fmt_psnr(r.psnr_db), f"{r.ssim:.4f}",
+         f"{r.runtime_ms:.3f}"]
         for r in rows if r.image == image
     ]
     return tabulate(body, headers=headers, tablefmt="fancy_grid",
@@ -224,33 +343,60 @@ def _per_image_table(rows: list[Row], image: str) -> str:
 
 
 def _metric_pivot(rows: list[Row], metric: str) -> str:
-    """
-    Compact table: rows = interpolation order, cols = input size.
-    `metric` is 'psnr_db', 'ssim' or 'runtime_ms'.
-    Cells are averaged across the four images to summarize the study.
-    """
-    orders: list[str] = []
-    seen: set[str] = set()
-    for r in rows:
-        if r.order not in seen:
-            seen.add(r.order)
-            orders.append(r.order)
-
+    """Rows = (family, order), columns = input size, averaged over images."""
     sizes = sorted({r.input_size for r in rows})
-    method_lookup = {r.order: r.method for r in rows}
-
-    headers = ["Order", "Method"] + [f"{s}x{s} -> 512" for s in sizes]
-    body: list[list[str]] = []
+    label = {(r.family, r.order): r.method for r in rows}
     decimals = {"psnr_db": 2, "ssim": 4, "runtime_ms": 3}[metric]
 
-    for order in orders:
-        line = [order, method_lookup[order]]
+    headers = ["Family", "Order", "Method"] + [f"{s}x{s} -> 512" for s in sizes]
+    body: list[list[str]] = []
+    for family, order in _ordered_keys(rows):
+        line = [family, order, label[(family, order)]]
         for s in sizes:
             values = [getattr(r, metric) for r in rows
-                      if r.order == order and r.input_size == s]
-            line.append(_fmt_number(sum(values) / len(values), decimals)
-                        if values else "-")
+                      if r.family == family and r.order == order
+                      and r.input_size == s]
+            line.append(_mean_cell(values, decimals) if values else "-")
         body.append(line)
+
+    return tabulate(body, headers=headers, tablefmt="fancy_grid",
+                    stralign="left", numalign="right")
+
+
+def _cross_family_table(rows: list[Row]) -> str:
+    """
+    Matched-order comparison between the families. Orders 0 and 1 are the same
+    operator and must agree; order 3 is where a cubic B-spline and Keys cubic
+    convolution genuinely differ, which is the interesting measurement.
+    """
+    sizes = sorted({r.input_size for r in rows})
+    shared = sorted({o for (f, o) in _ordered_keys(rows) if f == SPLINE}
+                    & {o for (f, o) in _ordered_keys(rows) if f == KERNEL})
+
+    def mean_psnr(family: str, order: str, size: int) -> float:
+        vals = [r.psnr_db for r in rows
+                if r.family == family and r.order == order
+                and r.input_size == size]
+        finite = [v for v in vals if math.isfinite(v)]
+        return sum(finite) / len(finite) if finite else math.inf
+
+    headers = ["Order", "Input", "B-spline (dB)", "Kernel (dB)", "Delta",
+               "Interpretation"]
+    body: list[list[str]] = []
+    for order in shared:
+        for s in sizes:
+            a, b = mean_psnr(SPLINE, order, s), mean_psnr(KERNEL, order, s)
+            same_operator = order in ("0", "1")
+            if math.isinf(a) and math.isinf(b):
+                delta = "0.00"
+            elif math.isinf(a) or math.isinf(b):
+                delta = "n/a"
+            else:
+                delta = f"{b - a:+.2f}"
+            note = ("same operator - must agree" if same_operator
+                    else "cubic B-spline vs Keys cubic")
+            body.append([order, f"{s}x{s}", _fmt_psnr(a), _fmt_psnr(b),
+                         delta, note])
 
     return tabulate(body, headers=headers, tablefmt="fancy_grid",
                     stralign="left", numalign="right")
@@ -258,7 +404,7 @@ def _metric_pivot(rows: list[Row], metric: str) -> str:
 
 def print_reports(rows: list[Row], images: list[str]) -> None:
     banner = "=" * 78
-    print(banner)
+    print("\n" + banner)
     print(" INTERPOLATION-BASED SUPER-RESOLUTION - RESULTS")
     print(banner)
 
@@ -278,33 +424,43 @@ def print_reports(rows: list[Row], images: list[str]) -> None:
 
     print("\nRuntime (ms) - lower is faster")
     print(_metric_pivot(rows, "runtime_ms"))
+    print("Note: spline timings include SciPy's Python-level call overhead, "
+          "so cross-family")
+    print("runtime is indicative of real-world cost, not of kernel arithmetic "
+          "alone.")
+
+    print("\n\n" + banner)
+    print(" CROSS-FAMILY COMPARISON AT MATCHED ORDER")
+    print(banner)
+    print(_cross_family_table(rows))
 
 
 def dump_csv(rows: list[Row], path: Path) -> None:
     with path.open("w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["image", "input_size", "factor", "order", "method",
-                    "psnr_db", "ssim", "runtime_ms"])
+        w.writerow(["image", "family", "input_size", "factor", "order",
+                    "method", "psnr_db", "ssim", "runtime_ms"])
         for r in rows:
-            w.writerow([r.image, r.input_size, r.factor, r.order, r.method,
-                        f"{r.psnr_db:.6f}", f"{r.ssim:.6f}",
+            w.writerow([r.image, r.family, r.input_size, r.factor, r.order,
+                        r.method, f"{r.psnr_db:.6f}", f"{r.ssim:.6f}",
                         f"{r.runtime_ms:.6f}"])
 
 
 def dump_markdown(rows: list[Row], images: list[str], path: Path) -> None:
-    lines: list[str] = ["# Assignment 2 - Interpolation-Based Super-Resolution",
-                        ""]
+    lines = ["# Assignment 2 - Interpolation-Based Super-Resolution", ""]
     for image in images:
-        lines.append(f"## {image}")
-        lines.append("")
-        lines.append("| Order | Method | Input | Factor | PSNR (dB) | SSIM | Runtime (ms) |")
-        lines.append("|-------|--------|-------|--------|-----------|------|--------------|")
+        lines += [f"## {image}", "",
+                  "| Family | Order | Method | Input | Factor | PSNR (dB) "
+                  "| SSIM | Runtime (ms) |",
+                  "|--------|-------|--------|-------|--------|-----------"
+                  "|------|--------------|"]
         for r in rows:
             if r.image != image:
                 continue
             lines.append(
-                f"| {r.order} | {r.method} | {r.input_size}x{r.input_size} "
-                f"| {r.factor}x | {r.psnr_db:.2f} | {r.ssim:.4f} "
+                f"| {r.family} | {r.order} | {r.method} "
+                f"| {r.input_size}x{r.input_size} | {r.factor}x "
+                f"| {_fmt_psnr(r.psnr_db)} | {r.ssim:.4f} "
                 f"| {r.runtime_ms:.3f} |")
         lines.append("")
 
@@ -312,11 +468,10 @@ def dump_markdown(rows: list[Row], images: list[str], path: Path) -> None:
     for metric, title in (("psnr_db", "PSNR (dB)"),
                           ("ssim", "SSIM"),
                           ("runtime_ms", "Runtime (ms)")):
-        lines.append(f"### {title}")
-        lines.append("")
-        lines.append(_metric_pivot(rows, metric))
-        lines.append("")
+        lines += [f"### {title}", "", _metric_pivot(rows, metric), ""]
 
+    lines += ["## Cross-family comparison at matched order", "",
+              _cross_family_table(rows), ""]
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -326,9 +481,8 @@ def dump_markdown(rows: list[Row], images: list[str], path: Path) -> None:
 
 def _discover_images(image_dir: Path) -> list[Path]:
     exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
-    files = sorted(p for p in image_dir.iterdir()
-                   if p.is_file() and p.suffix.lower() in exts)
-    return files
+    return sorted(p for p in image_dir.iterdir()
+                  if p.is_file() and p.suffix.lower() in exts)
 
 
 def main() -> int:
@@ -343,6 +497,8 @@ def main() -> int:
                         help="How many images from --images-dir to process.")
     parser.add_argument("--no-save-images", action="store_true",
                         help="Skip writing per-method output images.")
+    parser.add_argument("--skip-check", action="store_true",
+                        help="Skip the cross-family geometry self-check.")
     args = parser.parse_args()
 
     image_paths = _discover_images(args.images_dir)
@@ -363,6 +519,16 @@ def main() -> int:
     save_images = not args.no_save_images
     study = Study()
     image_names: list[str] = []
+
+    if not args.skip_check:
+        probe = load_grayscale_512(image_paths[0])
+        if not print_agreement(verify_family_agreement(probe, study.methods)):
+            print("\n[error] geometry self-check failed - the spline and "
+                  "kernel paths disagree", file=sys.stderr)
+            print("        at an order where they must match. Fix the "
+                  "coordinate convention", file=sys.stderr)
+            print("        before trusting any result.", file=sys.stderr)
+            return 1
 
     for path in image_paths:
         name = path.stem
