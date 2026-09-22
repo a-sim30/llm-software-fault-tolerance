@@ -1,0 +1,146 @@
+%==============================================================================
+%  Drop-in section: paste immediately BEFORE the bibliography environment
+%  Requires (already in your preamble): graphicx, booktabs, caption
+%  Needs fig7_match_example.png and fig8_invariance.png beside the .tex
+%==============================================================================
+\section{Results}
+
+All results are produced on the mandatory image, \texttt{skimage.data.camera()},
+$512\times512$, $8$-bit grayscale, converted to \texttt{float64} in $[0,1]$.
+The complete notebook executes in $\approx\Truntime$\,s from a fresh Colab
+runtime, against the three-minute limit.
+
+\subsection{Keypoint population}
+
+Table~\ref{tab:counts} shows how many keypoints survive each stage. The final
+count exceeds the localised count because a keypoint with several dominant
+orientations is duplicated, exactly as in SIFT.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lr@{}}
+\toprule
+Stage & Keypoints \\
+\midrule
+raw scale-space extrema                         & \Nraw  \\
+after weak-response and edge rejection          & \Nfilt \\
+after sub-pixel localisation and de-duplication & \Nloc  \\
+final oriented keypoints                        & \Nori  \\
+\bottomrule
+\end{tabular}
+\caption{Keypoint population at each stage of the pipeline.}
+\label{tab:counts}
+\end{table}
+
+\subsection{Invariance study}
+
+Because the method claims to be a \emph{scale invariant} feature transform,
+invariance is measured rather than asserted. A warp with a \emph{known}
+ground-truth transform is applied to Cameraman, the entire pipeline is re-run
+on the warped image, and the two keypoint sets are compared.
+
+\paragraph{Protocol.} Only the \emph{common region} is used: the part of the
+warped image that genuinely originates from the original one. The validity
+mask is eroded by $24$\,px so that a keypoint's whole support lies inside it,
+which excludes the black corners a rotation introduces. All warping uses
+bilinear interpolation with anti-aliasing disabled, since
+\texttt{scikit-image}'s anti-aliasing filter is itself Gaussian and would
+contradict the premise of the method. Three quantities are reported.
+
+\begin{itemize}\itemsep2pt
+\item \textbf{Repeatability} --- a purely geometric detector score: the
+fraction of common-region keypoints re-detected within $2.5$\,px of their
+mapped position and within a factor $1.5$ of their expected scale. It involves
+no descriptor at all.
+\item \textbf{Match precision} --- the fraction of accepted descriptor matches
+that are geometrically correct within $3$\,px.
+\item \textbf{Matching score} --- correct matches divided by the number of
+keypoints available in the common region, $\min(n_A,n_B)$.
+\end{itemize}
+
+\paragraph{Matching rule.} Lowe's ratio test at $0.8$ is used with two
+modifications. First, the second nearest neighbour must lie at least $4$\,px
+away from the first: without this, a structure detected twice (two
+orientations, or two adjacent scales) acts as its own second neighbour, the
+ratio approaches $1$, and a perfectly good match is discarded. Second, matches
+must be mutual nearest neighbours.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+Test & kp (A) & kp (B) & repeatability & matches & precision & m-score \\
+\midrule
+rotated $15^{\circ}$ &  870 & 1024 & 55.9\,\% & 428 & 84.8\,\% & 30.0\,\% \\
+rotated $30^{\circ}$ &  843 &  994 & 53.0\,\% & 370 & 83.0\,\% & 26.2\,\% \\
+rotated $45^{\circ}$ &  843 &  871 & 54.4\,\% & 416 & 84.6\,\% & 30.0\,\% \\
+rotated $90^{\circ}$ &  970 & 1027 & 81.3\,\% & 980 & 95.9\,\% & 69.6\,\% \\
+\addlinespace[2pt]
+zoom $\times1.50$    & 1044 & 3976 & 38.7\,\% & 509 & 71.5\,\% & 25.1\,\% \\
+zoom $\times0.75$    &  907 &  542 & 81.2\,\% & 304 & 77.6\,\% & 30.8\,\% \\
+\bottomrule
+\end{tabular}
+\caption{Invariance study. $n_A$ and $n_B$ count the keypoints of the original
+and the warped image that fall inside the common region.}
+\label{tab:bench}
+\end{table}
+
+\paragraph{Rotation.} Across $15^{\circ}$, $30^{\circ}$ and $45^{\circ}$ the
+figures are essentially flat --- repeatability $53$--$56\,\%$ and precision
+$83$--$85\,\%$ --- with no systematic dependence on the angle. That flatness is
+the practical payoff of the isotropic nine-point stencil of
+Section~\ref{sec:ss}: the scale space itself, and therefore the set of
+detected keypoints, does not favour the axes of the pixel grid.
+
+\paragraph{The $90^{\circ}$ row is a self-diagnostic.} A rotation by
+$90^{\circ}$ about the centre maps pixel $(x,y)$ to $(511-y,\,x)$: integer to
+integer, with no interpolation whatsoever. Since the stencil and
+$\det\mathbf{H}$ are both $90^{\circ}$ symmetric, an ideal implementation would
+score $100\,\%$. The measured $81.3\,\%$, and the fact that $n_A\neq n_B$,
+localise the residual error precisely --- and the cause is the filter-free
+decimation. Octave~$1$ retains the pixels with $x$ and $y$ both even; in the
+rotated image those are $x'=511-y$ and $y'=x$ both even, i.e.\ $x$ even and $y$
+\emph{odd} in original coordinates. The two pyramids therefore sample
+\emph{different lattices} from octave~$1$ onwards. Octave~$0$ repeats almost
+perfectly, the coarser octaves do not, and the weighted average lands near
+$80\,\%$. This is exactly the aliasing that SIFT's Gaussian pre-blur prevents,
+and it is the concrete price of eliminating that fifth Gaussian; the optional
+$3\times3$ box average described in Section~\ref{sec:ss} is the Gaussian-free
+remedy.
+
+\paragraph{Zoom.} The two zoom rows are not directly comparable to each other,
+because the $2.5$\,px tolerance is applied in the \emph{warped} frame: at
+$\times1.50$ that corresponds to only $1.67$ reference pixels, whereas at
+$\times0.75$ it corresponds to $3.33$. Zooming in is therefore measured under a
+stricter criterion than zooming out, which accounts for most of the gap between
+$38.7\,\%$ and $81.2\,\%$, and the $38.7\,\%$ figure should not be read as the
+detector performing twice as badly. Two genuine effects remain. Up-sampling to
+$768\times768$ resolves fine structure that does not exist at the original
+resolution, so the warped image yields far more keypoints ($3976$ against
+$1044$) and the extra detections have no counterpart to match. Down-sampling
+loses every structure finer than $\sigma_0=1.6$\,px, since --- unlike Lowe's
+implementation --- the input image is never doubled before processing.
+
+\paragraph{Overall.} Precision stays in the $72$--$96\,\%$ band across every
+test, so when the detector does re-find a structure, the Gaussian-free
+descriptor identifies it correctly the large majority of the time. The
+detector, not the descriptor, is the limiting component, and the $90^{\circ}$
+analysis above says exactly which part of it.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.92\textwidth]{fig7_match_example.png}
+\caption{Correctly matched keypoints between the original image and a
+$30^{\circ}$ rotated copy, under the protocol described above.}
+\label{fig:match}
+\end{figure}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.92\textwidth]{fig8_invariance.png}
+\caption{Repeatability, match precision and matching score as a function of
+rotation angle (left) and zoom factor (right).}
+\label{fig:inv}
+\end{figure}
