@@ -15,7 +15,8 @@
    #  Classical SIFT                        NDSS-SIFT replacement
    -- ------------------------------------  ---------------------------------
    1  Gaussian scale space L = G_s * I      Perona-Malik NONLINEAR diffusion
-                                            dL/dt = div( g(|grad L|) grad L ).
+                                            dL/dt = div( g(|grad L|) grad L ),
+                                            on an ISOTROPIC 9-point stencil.
                                             Because g depends on the image,
                                             the evolution is NOT a convolution
                                             at all: no kernel of any kind, let
@@ -33,7 +34,9 @@
                                             triangular histogram smoother
                                             [1 2 3 2 1]/9.
    5  Gaussian window for the 128-D         Triangular radial window over the
-      descriptor                            rotated descriptor patch.
+      descriptor                            rotated descriptor patch, widened
+                                            to 2.5x the patch half-width so it
+                                            mimics SIFT's Gaussian envelope.
 
  Derivatives everywhere are first/second order CENTRAL DIFFERENCES
  ([-1,0,1]/2 and [1,-2,1]); no Sobel / binomial [1,2,1] smoothing is used,
@@ -48,11 +51,14 @@
    2. 3x3x3 non-maximum suppression over (x, y, scale) -> raw extrema(Fig 3)
    3. rejection of weak (low response) and unstable (edge-like)
       detections via a principal-curvature ratio test                (Fig 4)
-   4. sub-pixel / sub-scale localisation by a 3-D quadratic fit      (Fig 5)
+   4. sub-pixel / sub-scale localisation by a 3-D quadratic fit,
+      followed by duplicate suppression                             (Fig 5)
    5. orientation assignment with a triangular window                (Fig 6)
-   6. 128-D descriptor + (optional) rotation-repeatability test      (Fig 7)
+   6. 128-D RootSIFT-normalised descriptor
+   7. invariance study: repeatability and matching under known
+      rotations and zooms                                     (Figs 7 and 8)
 
- Runtime: a few seconds on a Colab CPU runtime (limit is 3 minutes).
+ Runtime: well under a minute on a Colab CPU runtime (limit is 3 minutes).
 
  Usage in Colab (so that the figures appear inline):
      %run gaussian_free_sift.py
@@ -68,8 +74,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 from matplotlib.collections import PatchCollection, LineCollection
-from scipy.ndimage import maximum_filter
+from scipy.ndimage import maximum_filter, minimum_filter
+from scipy.spatial import cKDTree
 from skimage import data
+from skimage.transform import AffineTransform, warp
 
 # =============================================================================
 #  CONFIGURATION  (every tunable parameter lives here)
@@ -80,7 +88,8 @@ N_OCTAVES      = 4      # number of octaves (512, 256, 128, 64)
 N_SCALES       = 3      # S: usable scale levels per octave (S+3 levels built)
 SIGMA_0        = 1.6    # scale of the first level of every octave (px)
 K_PERCENTILE   = 70.0   # gradient percentile used for the P-M contrast factor
-DT_MAX         = 0.24   # explicit diffusion time step (stability limit = 0.25)
+DT_MAX         = 0.28   # explicit time step (isotropic stencil: limit = 0.30)
+OCTAVE_DOWNSAMPLE = "decimate"   # "decimate" (no filter at all) or "box3"
 
 # ---- detection -------------------------------------------------------------
 RESPONSE_FLOOR = 1e-6   # numerical floor: what counts as a "raw" extremum
@@ -90,25 +99,36 @@ BORDER         = 6      # pixels excluded at the image border (octave units)
 
 # ---- refinement ------------------------------------------------------------
 MAX_REFINE_ITER = 5     # Taylor-fit re-centring attempts
+DEDUP_PIXELS    = 1.5   # merge keypoints closer than this (image px) ...
+DEDUP_SCALE_RAT = 1.3   # ... if their scales differ by less than this factor
 
 # ---- orientation -----------------------------------------------------------
 ORI_BINS        = 36
-ORI_RADIUS_FAC  = 3.0   # window radius R = 3 * sigma (octave units)
+ORI_RADIUS_FAC  = 4.0   # window radius R = 4 * sigma (octave units)
 ORI_PEAK_RATIO  = 0.8   # secondary orientations kept above 80 % of the peak
+ORI_SOFT_BINS   = True  # linear interpolation between adjacent angle bins
 
 # ---- descriptor ------------------------------------------------------------
 COMPUTE_DESCRIPTORS = True
 DESC_NBINS      = 4     # 4 x 4 spatial cells
 DESC_NORI       = 8     # 8 orientation bins  -> 128-D
 DESC_CELL_FAC   = 3.0   # one descriptor cell spans 3 * sigma pixels
-DESC_MAX_RADIUS = 40    # cost cap on the sampling patch
+DESC_WINDOW_FAC = 2.5   # triangular envelope reaches 0 at 2.5 * half-width
+DESC_MAX_RADIUS = 48    # cost cap on the sampling patch
+USE_ROOT_NORM   = True  # RootSIFT normalisation (L1 + sqrt) after the L2 clip
 
 # ---- figures / extras ------------------------------------------------------
-SAVE_FIGURES        = True      # also write fig1..fig7 PNGs next to the script
-RUN_ROTATION_TEST   = True      # extra quantitative validation (Fig 7)
-ROTATION_ANGLE_DEG  = 30.0
+SAVE_FIGURES        = True      # also write fig1..fig8 PNGs next to the script
+RUN_BENCHMARK       = True      # invariance study (Figures 7 and 8)
+BENCH_ANGLES        = (15.0, 30.0, 45.0, 90.0)   # rotation tests (degrees)
+BENCH_SCALES        = (1.5, 0.75)                # zoom tests (in / out)
+BENCH_SHOW_ANGLE    = 30.0      # which rotation is drawn in Figure 7
 MATCH_RATIO_THR     = 0.8       # Lowe ratio test
+MATCH_MIN_SEP       = 4.0       # 2nd NN must be this far from the 1st (px)
+MATCH_MUTUAL        = True      # keep mutual nearest neighbours only
 MATCH_PIXEL_TOL     = 3.0       # a match is correct within 3 px
+REPEAT_PIXEL_TOL    = 2.5       # detector repeatability tolerance (px)
+REPEAT_SCALE_TOL    = 1.5       # ... and the admissible scale ratio
 
 RNG_SEED = 0
 np.random.seed(RNG_SEED)
@@ -192,11 +212,33 @@ def estimate_contrast_factor(L, percentile=K_PERCENTILE):
     return float(max(np.percentile(pos, percentile), 1e-6))
 
 
+# Neighbour offsets of the ISOTROPIC 9-point stencil, with the classical
+# weights 2/3 (axial) and 1/6 (diagonal).  With g == 1 the stencil reduces to
+#     (1/6) [[1, 4, 1], [4, -20, 4], [1, 4, 1]]
+# whose leading anisotropy error cancels, unlike the plain 4-neighbour
+# Laplacian.  Because the scale space is the only thing that decides where
+# keypoints appear, an isotropic stencil is what makes the detector rotation
+# invariant at the discrete level.  Sum of the weights = 10/3, so the explicit
+# scheme is stable for dt <= 3/10.
+_STENCIL = (( 0, +1, 2.0 / 3.0), ( 0, -1, 2.0 / 3.0),
+            (+1,  0, 2.0 / 3.0), (-1,  0, 2.0 / 3.0),
+            (+1, +1, 1.0 / 6.0), (+1, -1, 1.0 / 6.0),
+            (-1, +1, 1.0 / 6.0), (-1, -1, 1.0 / 6.0))
+STENCIL_WEIGHT_SUM = 10.0 / 3.0
+
+
+def _shift(P, dy, dx):
+    """Neighbour plane (dy, dx) of a 1-pixel edge-padded array."""
+    return P[1 + dy:P.shape[0] - 1 + dy, 1 + dx:P.shape[1] - 1 + dx]
+
+
 def _diffusion_step(L, k, dt):
-    """One explicit step of the Perona-Malik equation (4-neighbour stencil).
+    """One explicit step of the Perona-Malik equation, isotropic 9-point form.
 
     Half-pixel conductivities are obtained by averaging the two cell values,
-    which is the standard conservative discretisation of div(g grad L).
+    which is the standard conservative discretisation of div(g grad L):
+
+        L <- L + dt * sum_p  w_p * (g_p + g_c)/2 * (L_p - L_c)
     """
     gx, gy = d_x(L), d_y(L)
     g = 1.0 / (1.0 + (gx * gx + gy * gy) / (k * k))
@@ -204,13 +246,9 @@ def _diffusion_step(L, k, dt):
     Lp = _pad_edge(L)
     gp = _pad_edge(g)
 
-    g_e = 0.5 * (gp[1:-1, 2:] + g)      # east
-    g_w = 0.5 * (gp[1:-1, :-2] + g)     # west
-    g_s = 0.5 * (gp[2:, 1:-1] + g)      # south
-    g_n = 0.5 * (gp[:-2, 1:-1] + g)     # north
-
-    div = (g_e * (Lp[1:-1, 2:] - L) - g_w * (L - Lp[1:-1, :-2]) +
-           g_s * (Lp[2:, 1:-1] - L) - g_n * (L - Lp[:-2, 1:-1]))
+    div = np.zeros_like(L)
+    for dy, dx, w in _STENCIL:
+        div += w * (0.5 * (_shift(gp, dy, dx) + g)) * (_shift(Lp, dy, dx) - L)
     return L + dt * div
 
 
@@ -294,10 +332,33 @@ def build_scale_space(image,
                         "response": resp, "ratio": rat,
                         "octave": o, "k": k})
 
-        # ---- next octave: pure decimation, NO anti-alias (Gaussian) filter --
-        base = levels[n_scales][::2, ::2].copy()
+        # ---- next octave: NO anti-alias (Gaussian) filter -------------------
+        base = downsample(levels[n_scales])
 
     return octaves
+
+
+def downsample(L, method=None):
+    """Halve the resolution without any Gaussian pre-blur.
+
+    "decimate" : plain sub-sampling L[::2, ::2].  Grid-exact (pixel (i,j) of
+                 the new octave is pixel (2i,2j) of the old one) and entirely
+                 filter-free, which is the purest reading of the question.
+    "box3"     : one 3x3 BOX (uniform) average before sub-sampling.  A box
+                 kernel is not a Gaussian, and it removes the aliasing that
+                 the edge-preserving diffusion deliberately leaves behind.
+                 The 3x3 window is centred on the retained samples, so the
+                 sampling grid does not shift by half a pixel.
+    """
+    method = OCTAVE_DOWNSAMPLE if method is None else method
+    if method == "box3":
+        P = _pad_edge(L)
+        acc = np.zeros_like(L)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                acc += _shift(P, dy, dx)
+        L = acc / 9.0
+    return np.ascontiguousarray(L[::2, ::2])
 
 
 # =============================================================================
@@ -306,13 +367,18 @@ def build_scale_space(image,
 
 def detect_extrema(octaves, floor=RESPONSE_FLOOR, border=BORDER):
     """All strict local maxima of the response volume over (x, y, scale)."""
+    # footprint of the 26 neighbours WITHOUT the centre, so that the test
+    # below is a STRICT maximum: plateaus no longer yield duplicate keypoints
+    footprint = np.ones((3, 3, 3), dtype=bool)
+    footprint[1, 1, 1] = False
+
     raw = []
     for oct_data in octaves:
         R = oct_data["response"]
         n_lev, H, W = R.shape
 
-        local_max = maximum_filter(R, size=(3, 3, 3), mode="nearest")
-        is_max = (R >= local_max) & (R > floor)
+        nbr_max = maximum_filter(R, footprint=footprint, mode="nearest")
+        is_max = (R > nbr_max) & (R > floor)
 
         # the first and last level have no neighbour in scale
         is_max[0] = False
@@ -448,6 +514,42 @@ def refine_keypoints(octaves, kps,
     return refined
 
 
+def deduplicate(kps, pix_tol=DEDUP_PIXELS, scale_ratio=DEDUP_SCALE_RAT):
+    """Merge near-identical detections (same structure found twice).
+
+    The same blob is often picked up in two neighbouring octaves, or twice
+    inside one octave when the response has a flat ridge.  Such duplicates
+    carry almost identical descriptors, which is poison for the Lowe ratio
+    test, so the strongest representative of each cluster is kept.  A coarse
+    spatial hash keeps this O(N).
+    """
+    if not kps:
+        return kps
+    cell = max(pix_tol, 1e-6)
+    accepted, buckets = [], {}
+    for kp in sorted(kps, key=lambda p: -p["response"]):
+        cx, cy = int(kp["x"] / cell), int(kp["y"] / cell)
+        duplicate = False
+        for jy in (-1, 0, 1):
+            for jx in (-1, 0, 1):
+                for other in buckets.get((cx + jx, cy + jy), ()):
+                    if ((kp["x"] - other["x"]) ** 2 +
+                            (kp["y"] - other["y"]) ** 2) > pix_tol ** 2:
+                        continue
+                    r = kp["sigma"] / other["sigma"]
+                    if 1.0 / scale_ratio < r < scale_ratio:
+                        duplicate = True
+                        break
+                if duplicate:
+                    break
+            if duplicate:
+                break
+        if not duplicate:
+            accepted.append(kp)
+            buckets.setdefault((cx, cy), []).append(kp)
+    return accepted
+
+
 # =============================================================================
 #  6.  ORIENTATION ASSIGNMENT  (triangular window, no Gaussian)
 # =============================================================================
@@ -475,9 +577,19 @@ def _orientation_histogram(mag, ang, x, y, radius, n_bins=ORI_BINS):
     w = np.clip(1.0 - dist / float(radius), 0.0, None)
     weight = (sub_m * w).ravel()
 
-    bins = np.floor(sub_a.ravel() * (n_bins / (2.0 * np.pi))).astype(np.int64)
-    bins = np.mod(bins, n_bins)
-    hist = np.bincount(bins, weights=weight, minlength=n_bins)
+    pos = sub_a.ravel() * (n_bins / (2.0 * np.pi))      # continuous bin index
+    if ORI_SOFT_BINS:
+        # split every sample linearly over its two neighbouring bins: without
+        # this, the 10-degree quantisation alone costs several degrees of
+        # orientation error and therefore descriptor mismatches
+        b0 = np.floor(pos - 0.5).astype(np.int64)
+        frac = pos - 0.5 - b0
+        idx = np.concatenate([np.mod(b0, n_bins), np.mod(b0 + 1, n_bins)])
+        wts = np.concatenate([weight * (1.0 - frac), weight * frac])
+        hist = np.bincount(idx, weights=wts, minlength=n_bins)
+    else:
+        bins = np.mod(np.floor(pos).astype(np.int64), n_bins)
+        hist = np.bincount(bins, weights=weight, minlength=n_bins)
     return _smooth_hist_triangular(hist)
 
 
@@ -575,8 +687,14 @@ def compute_descriptor(mag, ang, x, y, sigma, theta,
     ub = u + n_bins / 2.0 - 0.5                  # continuous cell coordinates
     vb = v + n_bins / 2.0 - 0.5
 
+    # Triangular envelope.  Its support is DESC_WINDOW_FAC times the patch
+    # half-width, so the outer descriptor cells keep a weight comparable to
+    # the one SIFT's Gaussian gives them (~0.3 of the centre).  A cone that
+    # died at the patch border - the obvious first choice - silently throws
+    # the four corner cells away and makes the descriptor far less
+    # discriminative.
     dist = np.sqrt(dx * dx + dy * dy)
-    w_rad = np.clip(1.0 - dist / float(radius), 0.0, None)
+    w_rad = np.clip(1.0 - dist / (DESC_WINDOW_FAC * half), 0.0, None)
 
     a = np.mod(ang[y0:y1, x0:x1] - theta, 2.0 * np.pi)
     ob = a * (n_ori / (2.0 * np.pi))
@@ -622,6 +740,16 @@ def compute_descriptor(mag, ang, x, y, sigma, theta,
     norm = np.linalg.norm(desc)
     if norm > 1e-12:
         desc /= norm
+
+    if USE_ROOT_NORM:
+        # RootSIFT: L1-normalise then take the square root.  The Euclidean
+        # distance between the results equals the Hellinger distance between
+        # the raw histograms, which down-weights the few large bins that
+        # otherwise dominate the comparison.  The result is already L2
+        # normalised, so the matching code is unchanged.
+        s = desc.sum()
+        if s > 1e-12:
+            desc = np.sqrt(desc / s)
     return desc
 
 
@@ -646,7 +774,7 @@ def ndss_sift(image, verbose=True):
     timings["filtering"] = time.time() - t0
 
     t0 = time.time()
-    refined = refine_keypoints(octaves, filtered)
+    refined = deduplicate(refine_keypoints(octaves, filtered))
     timings["refinement"] = time.time() - t0
 
     t0 = time.time()
@@ -808,74 +936,281 @@ def figure_6_oriented(image, oriented):
 
 
 # =============================================================================
-# 10.  OPTIONAL VALIDATION: ROTATION REPEATABILITY + DESCRIPTOR MATCHING
+# 10.  VALIDATION: REPEATABILITY AND MATCHING UNDER KNOWN GEOMETRIC WARPS
+# =============================================================================
+#
+#  The detector is evaluated exactly the way the literature does it: a warp
+#  with a KNOWN ground-truth transform is applied, the whole pipeline is re-run
+#  on the warped image, and two numbers are reported.
+#
+#    repeatability  - a purely geometric detector score: the fraction of
+#                     keypoints of the common region that are re-detected at
+#                     the right place and the right scale.
+#    matching score - a descriptor score: correctly matched keypoints divided
+#                     by the number of keypoints available in the common
+#                     region, plus the precision of the accepted matches.
+#
+#  Only the common region is used, i.e. the part of the warped image that
+#  really comes from the original one; the black corners a rotation creates
+#  are excluded, together with a margin so that a keypoint's support is
+#  entirely inside the valid area.  All warping uses bilinear interpolation
+#  and NO anti-aliasing filter, since skimage's anti-aliasing is Gaussian.
 # =============================================================================
 
-def rotation_test(image, kps_a, angle_deg=ROTATION_ANGLE_DEG):
-    """Detect on a rotated copy, match descriptors, report correct matches."""
-    from skimage.transform import AffineTransform, warp
+COMMON_REGION_MARGIN = 24      # px kept away from the border of the valid area
 
-    H, W = image.shape
-    centre = np.array([(W - 1) / 2.0, (H - 1) / 2.0])
-    tform = (AffineTransform(translation=-centre) +
+
+def rotation_transform(shape, angle_deg):
+    """Rotation about the image centre; output keeps the original size."""
+    H, W = shape
+    c = np.array([(W - 1) / 2.0, (H - 1) / 2.0])
+    tform = (AffineTransform(translation=-c) +
              AffineTransform(rotation=np.deg2rad(angle_deg)) +
-             AffineTransform(translation=centre))
-    rotated = warp(image, tform.inverse, order=1, mode="constant", cval=0.0,
-                   preserve_range=True)
+             AffineTransform(translation=c))
+    return tform, (H, W), 1.0
 
-    res_b = ndss_sift(rotated, verbose=False)
-    kps_b = res_b["oriented"]
-    if not kps_a or not kps_b:
-        return None
 
-    da = np.array([kp["descriptor"] for kp in kps_a])
-    db = np.array([kp["descriptor"] for kp in kps_b])
-    pa = np.array([[kp["x"], kp["y"]] for kp in kps_a])
-    pb = np.array([[kp["x"], kp["y"]] for kp in kps_b])
+def scale_transform(shape, factor):
+    """Pure zoom; the output canvas follows the zoom factor."""
+    H, W = shape
+    tform = AffineTransform(scale=(factor, factor))
+    return tform, (int(round(H * factor)), int(round(W * factor))), factor
 
-    # keep only source keypoints that stay well inside the rotated image
-    pa_mapped = tform(pa)
-    margin = 20.0
-    inside = ((pa_mapped[:, 0] > margin) & (pa_mapped[:, 0] < W - margin) &
-              (pa_mapped[:, 1] > margin) & (pa_mapped[:, 1] < H - margin))
-    da, pa, pa_mapped = da[inside], pa[inside], pa_mapped[inside]
-    if len(da) == 0:
-        return None
 
-    # descriptors are L2 normalised  =>  d^2 = 2 - 2 <a,b>
+def warp_image(image, tform, out_shape):
+    """Warp `image` and return it together with its validity mask."""
+    warped = warp(image, tform.inverse, order=1, mode="constant", cval=0.0,
+                  output_shape=out_shape, preserve_range=True)
+    valid = warp(np.ones_like(image), tform.inverse, order=0, mode="constant",
+                 cval=0.0, output_shape=out_shape, preserve_range=True)
+    return warped, valid > 0.5
+
+
+def _common_region(valid, margin=COMMON_REGION_MARGIN):
+    """Erode the validity mask so a keypoint's whole support stays inside."""
+    return minimum_filter(valid.astype(np.uint8), size=int(2 * margin + 1),
+                          mode="constant", cval=0) > 0
+
+
+def _inside(mask, pts):
+    """Boolean test of (x, y) points against a mask."""
+    H, W = mask.shape
+    xi = np.rint(pts[:, 0]).astype(np.int64)
+    yi = np.rint(pts[:, 1]).astype(np.int64)
+    ok = (xi >= 0) & (xi < W) & (yi >= 0) & (yi < H)
+    out = np.zeros(len(pts), dtype=bool)
+    out[ok] = mask[yi[ok], xi[ok]]
+    return out
+
+
+def match_descriptors(da, db, pb,
+                      ratio_thr=MATCH_RATIO_THR,
+                      min_sep=MATCH_MIN_SEP,
+                      mutual=MATCH_MUTUAL):
+    """Lowe ratio test, made duplicate-proof, plus a mutual-consistency check.
+
+    Descriptors are L2 normalised, so  d^2 = 2 - 2 <a, b>.
+
+    The plain ratio test breaks down when the second nearest neighbour is the
+    SAME physical point detected twice (two orientations, or two adjacent
+    scales): the ratio is then close to 1 and a perfectly good match is
+    thrown away.  The second neighbour is therefore required to be at least
+    `min_sep` pixels away from the first one.
+    """
     d2 = np.maximum(2.0 - 2.0 * (da @ db.T), 0.0)
     order = np.argsort(d2, axis=1)
+    n_a = d2.shape[0]
+
     best = order[:, 0]
-    second = order[:, 1] if d2.shape[1] > 1 else order[:, 0]
-    r = np.sqrt(d2[np.arange(len(da)), best] /
-                np.maximum(d2[np.arange(len(da)), second], 1e-12))
+    second = np.copy(best)
+    for i in range(n_a):
+        p0 = pb[best[i]]
+        for j in order[i, 1:]:
+            if np.hypot(*(pb[j] - p0)) >= min_sep:
+                second[i] = j
+                break
 
-    accepted = r < MATCH_RATIO_THR
-    err = np.linalg.norm(pb[best] - pa_mapped, axis=1)
-    correct = accepted & (err < MATCH_PIXEL_TOL)
+    rows = np.arange(n_a)
+    denom = np.maximum(d2[rows, second], 1e-12)
+    ratio = np.sqrt(d2[rows, best] / denom)
+    accepted = (ratio < ratio_thr) & (second != best)
 
-    stats = {"n_src": int(len(da)), "n_dst": int(len(kps_b)),
-             "n_matches": int(accepted.sum()), "n_correct": int(correct.sum()),
-             "precision": float(correct.sum() / max(accepted.sum(), 1)),
-             "angle": angle_deg}
+    if mutual:
+        accepted &= (np.argmin(d2, axis=0)[best] == rows)
+    return best, accepted
 
-    fig, axes = plt.subplots(1, 2, figsize=(11.0, 5.6))
+
+def evaluate_transform(image, ref, tform, out_shape, scale_factor, label,
+                       keep_figure_data=False):
+    """Run the full pipeline on a warped copy and score detector + descriptor."""
+    warped, valid = warp_image(image, tform, out_shape)
+    region = _common_region(valid)
+    res = ndss_sift(warped, verbose=False)
+
+    if not ref["refined"] or not res["refined"]:
+        return None
+
+    # ---------------- detector repeatability --------------------------------
+    pa = np.array([[kp["x"], kp["y"]] for kp in ref["refined"]])
+    sa = np.array([kp["sigma"] for kp in ref["refined"]])
+    pb = np.array([[kp["x"], kp["y"]] for kp in res["refined"]])
+    sb = np.array([kp["sigma"] for kp in res["refined"]])
+
+    pa_m = tform(pa)
+    keep_a = _inside(region, pa_m)
+    keep_b = _inside(region, pb)
+    n_a, n_b = int(keep_a.sum()), int(keep_b.sum())
+    if n_a == 0 or n_b == 0:
+        return None
+
+    tree = cKDTree(pb)
+    n_corr = 0
+    for p, s in zip(pa_m[keep_a], sa[keep_a] * scale_factor):
+        for j in tree.query_ball_point(p, REPEAT_PIXEL_TOL):
+            if 1.0 / REPEAT_SCALE_TOL < sb[j] / s < REPEAT_SCALE_TOL:
+                n_corr += 1
+                break
+    repeatability = n_corr / float(min(n_a, n_b))
+
+    # ---------------- descriptor matching -----------------------------------
+    stats = {"label": label, "n_a": n_a, "n_b": n_b, "n_corr": n_corr,
+             "repeatability": repeatability, "scale_factor": scale_factor,
+             "n_matches": 0, "n_correct": 0, "precision": 0.0,
+             "matching_score": 0.0}
+
+    if COMPUTE_DESCRIPTORS and ref["oriented"] and res["oriented"]:
+        qa = np.array([[kp["x"], kp["y"]] for kp in ref["oriented"]])
+        qb = np.array([[kp["x"], kp["y"]] for kp in res["oriented"]])
+        qa_m = tform(qa)
+        ka = _inside(region, qa_m)
+        kb = _inside(region, qb)
+        if ka.sum() and kb.sum():
+            da = np.array([kp["descriptor"] for kp in ref["oriented"]])[ka]
+            db = np.array([kp["descriptor"] for kp in res["oriented"]])[kb]
+            qa_m, qb = qa_m[ka], qb[kb]
+
+            best, accepted = match_descriptors(da, db, qb)
+            err = np.linalg.norm(qb[best] - qa_m, axis=1)
+            correct = accepted & (err < MATCH_PIXEL_TOL)
+
+            stats["n_matches"] = int(accepted.sum())
+            stats["n_correct"] = int(correct.sum())
+            stats["precision"] = float(correct.sum() /
+                                       max(accepted.sum(), 1))
+            stats["matching_score"] = float(correct.sum() /
+                                            min(len(da), len(db)))
+            if keep_figure_data:
+                stats["figure"] = {"warped": warped,
+                                   "src": qa[ka][correct],
+                                   "dst": qb[best[correct]]}
+    return stats
+
+
+def figure_7_match_example(image, stats):
+    """Side-by-side view of the correctly matched keypoints."""
+    fd = stats.get("figure")
+    if fd is None:
+        return
+    fig, axes = plt.subplots(1, 2, figsize=(11.2, 5.8))
     axes[0].imshow(image, cmap="gray", vmin=0, vmax=1)
-    axes[0].scatter(pa[correct, 0], pa[correct, 1], s=9, c="lime", marker="o")
+    axes[0].scatter(fd["src"][:, 0], fd["src"][:, 1], s=10, c="lime")
     axes[0].set_title("original - %d correctly matched keypoints"
                       % stats["n_correct"])
     axes[0].axis("off")
-    axes[1].imshow(rotated, cmap="gray", vmin=0, vmax=1)
-    axes[1].scatter(pb[best[correct], 0], pb[best[correct], 1], s=9,
-                    c="lime", marker="o")
-    axes[1].set_title("rotated %.0f deg - same keypoints" % angle_deg)
+    axes[1].imshow(fd["warped"], cmap="gray", vmin=0, vmax=1)
+    axes[1].scatter(fd["dst"][:, 0], fd["dst"][:, 1], s=10, c="lime")
+    axes[1].set_title("%s - the same keypoints" % stats["label"])
     axes[1].axis("off")
-    fig.suptitle("Figure 7 (extra) - rotation invariance check: %d/%d matches "
-                 "correct (%.1f %%)" % (stats["n_correct"], stats["n_matches"],
-                                        100.0 * stats["precision"]))
+    fig.suptitle("Figure 7 (extra) - %s : repeatability %.1f %%, "
+                 "%d/%d accepted matches correct (%.1f %%)"
+                 % (stats["label"], 100.0 * stats["repeatability"],
+                    stats["n_correct"], stats["n_matches"],
+                    100.0 * stats["precision"]))
     fig.tight_layout(rect=(0, 0, 1, 0.93))
-    _show(fig, "fig7_rotation_test.png")
-    return stats
+    _show(fig, "fig7_match_example.png")
+
+
+def figure_8_invariance(rot_stats, scale_stats):
+    """Repeatability / precision curves against rotation and against zoom."""
+    fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.4))
+
+    if rot_stats:
+        ang = [s["angle"] for s in rot_stats]
+        axes[0].plot(ang, [100 * s["repeatability"] for s in rot_stats],
+                     "o-", label="repeatability")
+        axes[0].plot(ang, [100 * s["precision"] for s in rot_stats],
+                     "s--", label="match precision")
+        axes[0].plot(ang, [100 * s["matching_score"] for s in rot_stats],
+                     "^:", label="matching score")
+        axes[0].set_xlabel("rotation angle [deg]")
+    axes[0].set_ylabel("[%]")
+    axes[0].set_ylim(0, 105)
+    axes[0].grid(alpha=0.3)
+    axes[0].legend(fontsize=8)
+    axes[0].set_title("rotation invariance")
+
+    if scale_stats:
+        fac = [s["scale_factor"] for s in scale_stats]
+        axes[1].plot(fac, [100 * s["repeatability"] for s in scale_stats],
+                     "o-", label="repeatability")
+        axes[1].plot(fac, [100 * s["precision"] for s in scale_stats],
+                     "s--", label="match precision")
+        axes[1].plot(fac, [100 * s["matching_score"] for s in scale_stats],
+                     "^:", label="matching score")
+        axes[1].set_xlabel("zoom factor")
+    axes[1].set_ylim(0, 105)
+    axes[1].grid(alpha=0.3)
+    axes[1].legend(fontsize=8)
+    axes[1].set_title("scale invariance")
+
+    fig.suptitle("Figure 8 (extra) - invariance of NDSS-SIFT")
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    _show(fig, "fig8_invariance.png")
+
+
+def run_benchmark(image, ref):
+    """Rotation and scale study; prints a table and draws Figures 7 and 8."""
+    rot_stats, scale_stats, show_me = [], [], None
+
+    for angle in BENCH_ANGLES:
+        tform, shape, factor = rotation_transform(image.shape, angle)
+        want = abs(angle - BENCH_SHOW_ANGLE) < 1e-9
+        st = evaluate_transform(image, ref, tform, shape, factor,
+                                "rotated %.0f deg" % angle,
+                                keep_figure_data=want)
+        if st is None:
+            continue
+        st["angle"] = angle
+        rot_stats.append(st)
+        if want:
+            show_me = st
+
+    for factor in BENCH_SCALES:
+        # Zooming out is the harder direction: no anti-alias filter is applied
+        # (skimage's is Gaussian), and structures smaller than sigma_0 simply
+        # disappear, since the input image is never up-sampled the way Lowe's
+        # SIFT does it.
+        tform, shape, sf = scale_transform(image.shape, factor)
+        st = evaluate_transform(image, ref, tform, shape, sf,
+                                "zoom x%.2f" % factor)
+        if st is not None:
+            scale_stats.append(st)
+
+    rows = rot_stats + scale_stats
+    if rows:
+        print("    %-16s %7s %7s %8s %8s %9s %9s" %
+              ("test", "kp(A)", "kp(B)", "repeat", "matches", "precision",
+               "m-score"))
+        for s in rows:
+            print("    %-16s %7d %7d %7.1f%% %8d %8.1f%% %8.1f%%" %
+                  (s["label"], s["n_a"], s["n_b"],
+                   100 * s["repeatability"], s["n_matches"],
+                   100 * s["precision"], 100 * s["matching_score"]))
+
+    if show_me is not None:
+        figure_7_match_example(image, show_me)
+    figure_8_invariance(rot_stats, scale_stats)
+    return rows
 
 
 # =============================================================================
@@ -919,20 +1254,15 @@ def main():
 
     if COMPUTE_DESCRIPTORS and res["oriented"]:
         desc = np.array([kp["descriptor"] for kp in res["oriented"]])
-        print("\n[6] descriptor matrix        : %s (128-D, L2 normalised)"
-              % (desc.shape,))
+        print("\n[6] descriptor matrix        : %s (128-D, RootSIFT%s)"
+              % (desc.shape, "" if USE_ROOT_NORM else "-off, plain L2"))
 
-    # ---------------- Step 7 : optional validation --------------------------
-    if RUN_ROTATION_TEST and COMPUTE_DESCRIPTORS:
-        print("\n[7] rotation-invariance check (%.0f deg) ..."
-              % ROTATION_ANGLE_DEG)
-        stats = rotation_test(image, res["oriented"])
-        if stats:
-            print("    source keypoints (inside)  : %d" % stats["n_src"])
-            print("    rotated-image keypoints    : %d" % stats["n_dst"])
-            print("    accepted matches           : %d" % stats["n_matches"])
-            print("    geometrically correct      : %d  (%.1f %% precision)"
-                  % (stats["n_correct"], 100.0 * stats["precision"]))
+    # ---------------- Step 7 : validation -----------------------------------
+    if RUN_BENCHMARK:
+        print("\n[7] invariance study (rotations %s, zooms %s) ..."
+              % (", ".join("%.0f deg" % a for a in BENCH_ANGLES),
+                 ", ".join("x%.2f" % s for s in BENCH_SCALES)))
+        run_benchmark(image, res)
 
     # ---------------- audit + timing ----------------------------------------
     print("\n" + "-" * 74)
@@ -940,12 +1270,16 @@ def main():
     print("-" * 74)
     for line in [
         "scale space          : Perona-Malik nonlinear diffusion (no kernel)",
+        "diffusion stencil    : isotropic 9-point, weights 2/3 and 1/6",
         "blob response        : sigma^4 det(Hessian) from central differences",
-        "octave down-sampling : plain decimation L[::2,::2] (no pre-blur)",
+        "octave down-sampling : %s" % ("plain decimation L[::2,::2], no filter"
+                                       if OCTAVE_DOWNSAMPLE == "decimate"
+                                       else "3x3 BOX (uniform) average"),
         "orientation window   : triangular  w = max(0, 1 - r/R)",
         "histogram smoothing  : triangular  [1 2 3 2 1] / 9",
         "descriptor window    : triangular  w = max(0, 1 - r/R)",
         "derivatives          : [-1,0,1]/2 and [1,-2,1]  (no binomial [1,2,1])",
+        "evaluation warps     : bilinear, anti_aliasing never enabled",
     ]:
         print("  * " + line)
     print("  => zero Gaussian kernels anywhere in the pipeline.")
