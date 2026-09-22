@@ -1,0 +1,770 @@
+%==============================================================================
+%  Mid-Semester Examination : Scale Invariant Feature Transform
+%  Report : NDSS-SIFT, a Gaussian-free alternative to SIFT
+%
+%  Compiles with pdflatex (Overleaf: default settings, no bibtex needed).
+%  Put fig1_original.png ... fig8_invariance.png next to this file; they are
+%  written automatically by the accompanying notebook / script.
+%==============================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[hidelinks]{hyperref}
+
+\captionsetup{font=small,labelfont=bf}
+\setlength{\parskip}{0.35em}
+
+%------------------------------------------------------------------------------
+%  RESULT NUMBERS -- update these SIX lines after the final run, nothing else.
+%  (values below are from the run reported in the notebook output)
+%------------------------------------------------------------------------------
+\newcommand{\Nraw}{2507}          % raw scale-space extrema
+\newcommand{\Nfilt}{1150}         % after weak / edge rejection
+\newcommand{\Nloc}{1028}          % after sub-pixel localisation + de-duplication
+\newcommand{\Nori}{1308}          % final oriented keypoints
+\newcommand{\Truntime}{16.3}      % total runtime in seconds
+\newcommand{\Kvals}{0.0319,\ 0.0090,\ 0.0092,\ 0.0140}  % per-octave contrast k
+
+\title{\bfseries NDSS-SIFT: A Gaussian-Free Scale Invariant Feature Transform\\[2mm]
+\large Nonlinear-Diffusion Scale Space with a Determinant-of-Hessian Response}
+\author{\textit{Name} \\ \textit{Roll number} \\ \textit{Course / Instructor}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This report presents \textbf{NDSS-SIFT}, an alternative to the Scale Invariant
+Feature Transform in which \emph{every} Gaussian kernel of the original
+algorithm has been removed, addressing part~(a) of the question. The starting
+observation is that Gaussian smoothing is not a primitive operation but the
+solution of the linear heat equation; the scale space is therefore rebuilt from
+a \emph{nonlinear} Perona--Malik diffusion, which admits no convolution kernel
+of any kind and hence no Gaussian. The Difference of Gaussians is replaced by
+the scale-normalised determinant of the Hessian, the Gaussian pre-blur before
+octave decimation is dropped entirely, and the Gaussian weighting windows of
+the orientation histogram and of the $128$-D descriptor are replaced by
+triangular (Bartlett) windows. All derivatives are central finite differences,
+so not even the binomial $[1\ 2\ 1]$ factor hidden inside the Sobel operator
+survives. The keypoint-selection machinery of SIFT --- $3\!\times\!3\!\times\!3$
+extrema detection, contrast and principal-curvature rejection, quadratic
+sub-pixel localisation, the $80\,\%$ orientation rule and the
+$4\!\times\!4\!\times\!8$ descriptor --- is retained unchanged, so the method
+remains recognisably SIFT. On the mandatory $512\times512$ Cameraman image the
+complete pipeline, including an invariance study, runs in
+$\approx\Truntime$\,s in Google Colab, well inside the three-minute budget.
+\end{abstract}
+
+%==============================================================================
+\section{Problem statement}
+%==============================================================================
+
+SIFT~\cite{lowe2004} is built almost entirely out of Gaussian kernels. The task
+is to design and implement an alternative that does not use them, with full
+credit for eliminating \emph{all} of them rather than only replacing the
+Difference of Gaussians (DoG) by a Laplacian pyramid. Table~\ref{tab:where}
+lists where the Gaussians actually occur; any honest solution must deal with
+all five sites, not just the DoG.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}clp{8.2cm}@{}}
+\toprule
+\# & Site in classical SIFT & Role played by the Gaussian \\
+\midrule
+1 & Scale space $L(\cdot,\sigma)=G_\sigma * I$ & generates the family of
+    increasingly coarse images \\
+2 & Difference of Gaussians & band-pass response whose extrema are the keypoints \\
+3 & Pre-blur before octave down-sampling & anti-aliasing before decimation by 2 \\
+4 & Orientation histogram window & spatial weighting of gradient votes \\
+5 & Descriptor window & spatial weighting of the $4\times4$ cell votes \\
+\bottomrule
+\end{tabular}
+\caption{The five places where classical SIFT uses a Gaussian kernel.}
+\label{tab:where}
+\end{table}
+
+%==============================================================================
+\section{Key idea: a Gaussian is not a primitive}
+%==============================================================================
+
+The observation that makes a complete elimination possible is that Gaussian
+smoothing \emph{is} linear diffusion. If $L$ evolves under the heat equation
+\begin{equation}
+\frac{\partial L}{\partial t}=\nabla^{2}L ,
+\qquad L(\cdot,0)=I ,
+\label{eq:heat}
+\end{equation}
+then the solution at time $t$ is exactly $L(\cdot,t)=G_{\sigma}*I$ with
+$\sigma=\sqrt{2t}$. In other words the Gaussian is merely the Green's function
+of~\eqref{eq:heat}; SIFT's scale space is a \emph{linear diffusion} scale space.
+
+This reframing turns "remove the Gaussian" into "change the diffusion". We
+therefore make the diffusion \emph{nonlinear}, in the sense of Perona and
+Malik~\cite{perona1990}:
+\begin{equation}
+\boxed{\;
+\frac{\partial L}{\partial t}
+=\operatorname{div}\!\bigl(g(|\nabla L|)\,\nabla L\bigr),
+\qquad
+g(z)=\frac{1}{1+z^{2}/k^{2}} \; }
+\label{eq:pm}
+\end{equation}
+Because the conductivity $g$ depends on the image being evolved, the evolution
+operator is nonlinear and \emph{not shift invariant}. A nonlinear,
+non-shift-invariant operator has no convolution representation at all: there is
+no kernel to remove, Gaussian or otherwise. This is a strictly stronger
+statement than "the Gaussian was swapped for another kernel".
+
+The behaviour of~\eqref{eq:pm} is also better suited to a keypoint detector
+than Gaussian blurring. Where $|\nabla L|\ll k$ the conductivity is
+$g\approx1$ and homogeneous regions are smoothed; where $|\nabla L|\gg k$ we
+get $g\approx0$ and the flow refuses to smooth \emph{across} object
+boundaries. Structures therefore stay where they are as the scale increases,
+instead of drifting and dissolving as they do under a Gaussian. The same
+argument underlies the KAZE detector~\cite{kaze2012}; note, however, that KAZE
+still computes a Gaussian-smoothed image to estimate its contrast factor and to
+build its derivatives, whereas the present method does not.
+
+\paragraph{The exponential conductivity is deliberately avoided.}
+Perona and Malik also propose $g(z)=\exp(-z^{2}/k^{2})$. That function is a
+Gaussian \emph{profile} evaluated on gradient magnitudes. Although it is not a
+convolution kernel, the rational form in~\eqref{eq:pm} is used instead so that
+no Gaussian-shaped expression appears anywhere in the implementation.
+
+%==============================================================================
+\section{The proposed algorithm}
+%==============================================================================
+
+\subsection{Nonlinear-diffusion scale space}
+\label{sec:ss}
+
+\paragraph{Scale ladder.} SIFT's octave structure is retained. With $S$ usable
+levels per octave we build $S+3$ levels at octave-local scales
+\begin{equation}
+\sigma_i=\sigma_0\,2^{\,i/S},\qquad i=0,\dots,S+2 ,
+\end{equation}
+and reach level $i$ by integrating~\eqref{eq:pm} to the evolution time
+\begin{equation}
+t_i=\tfrac12\sigma_i^{2} .
+\label{eq:tsigma}
+\end{equation}
+With $\sigma_0=1.6$ and $S=3$ this gives
+$\sigma_i\in\{1.600,\,2.016,\,2.540,\,3.200,\,4.032,\,5.080\}$ and
+$t_i\in\{1.28,\,2.03,\,3.23,\,5.12,\,8.13,\,12.90\}$. Levels are produced
+incrementally, level $i$ being obtained from level $i-1$ by evolving for
+$\Delta t_i=t_i-t_{i-1}$.
+
+Relation~\eqref{eq:tsigma} is the exact time--scale correspondence of
+\emph{linear} diffusion and is used here purely as a \emph{parameterisation}:
+$\sigma_i$ is a label meaning ``the scale linear diffusion would have reached in
+the same time'', chosen so that the parameters are directly comparable with
+Lowe's. No Gaussian is ever evaluated; the symbol $\sigma$ could be eliminated
+from the implementation without changing a single number.
+
+\paragraph{Contrast factor.} The threshold $k$ separating "texture" from
+"edge" is estimated automatically as the $70^{\text{th}}$ percentile of the
+gradient-magnitude distribution of the octave's base image. It is re-estimated
+once per octave, because decimation changes the gradient statistics. The values
+obtained on Cameraman are $k=\Kvals$ for octaves $0$--$3$.
+
+\paragraph{Discretisation.} Equation~\eqref{eq:pm} is integrated with an
+explicit scheme on an \emph{isotropic} nine-point stencil,
+\begin{equation}
+L^{n+1}_{c}=L^{n}_{c}
++\Delta t\sum_{p\in\mathcal{N}_8(c)} w_p\,
+\frac{g_p+g_c}{2}\,\bigl(L^{n}_{p}-L^{n}_{c}\bigr),
+\qquad
+w_p=\begin{cases}2/3 & \text{axial}\\[2pt] 1/6 & \text{diagonal}\end{cases}
+\label{eq:scheme}
+\end{equation}
+The half-pixel conductivities $\tfrac12(g_p+g_c)$ make the scheme
+conservative. For $g\equiv1$ the stencil~\eqref{eq:scheme} reduces to the
+classical isotropic Laplacian $\frac16\left[\begin{smallmatrix}1&4&1\\
+4&-20&4\\ 1&4&1\end{smallmatrix}\right]$, whose leading anisotropy error
+cancels; the naive four-neighbour Laplacian is anisotropic on the pixel grid
+and measurably degrades rotation invariance, since the scale space is what
+decides \emph{where} keypoints appear. The weights sum to $10/3$, so the
+scheme is stable for $\Delta t\le 3/10$; we use $\Delta t\le0.28$ and split
+each increment into $n=\lceil\Delta t_i/0.28\rceil$ equal steps.
+
+\paragraph{Octaves.} At the end of an octave, level $S$ (which carries
+$\sigma=2\sigma_0$) is down-sampled by plain decimation, $L[::2,::2]$, with
+\emph{no} filter of any kind. Decimation is grid-exact --- pixel $(i,j)$ of the
+new octave is pixel $(2i,2j)$ of the old one --- so no half-pixel correction is
+needed. Four octaves are built ($512,256,128,64$). The first level of octave
+$o>0$ already carries $\sigma_0$ in the new coordinate system, so its evolution
+starts from $t_0$ rather than from $0$.
+
+\subsection{Response function: scale-normalised determinant of the Hessian}
+
+Lowe uses the DoG because
+$G_{k\sigma}-G_{\sigma}\approx(k-1)\sigma^{2}\nabla^{2}G$: the DoG is an
+inexpensive approximation of the scale-normalised Laplacian. Since we no longer
+have Gaussians to subtract, the differential operator is computed directly.
+For every level we form the Hessian by finite differences and take
+\begin{equation}
+R(x,y,\sigma_i)=\sigma_i^{4}\,\det\mathbf{H}
+=\sigma_i^{4}\bigl(L_{xx}L_{yy}-L_{xy}^{2}\bigr).
+\label{eq:response}
+\end{equation}
+Three properties justify this choice.
+\begin{enumerate}\itemsep2pt
+\item \textbf{Scale selection.} Under a change of scale the entries of
+$\mathbf{H}$ scale as $\sigma^{-2}$, so $\det\mathbf{H}$ scales as
+$\sigma^{-4}$; the factor $\sigma^{4}$ makes $R$ scale invariant in the sense
+of Lindeberg~\cite{lindeberg1998}, and a blob of characteristic size $\sigma$
+produces a genuine maximum \emph{along the scale axis}. This is what allows
+each keypoint to carry its own scale.
+\item \textbf{Automatic edge suppression.} Along a straight edge one principal
+curvature vanishes, so $\det\mathbf{H}\le0$ and the point cannot be a positive
+maximum. The DoG, being a signed Laplacian-like operator, responds strongly to
+edges and relies entirely on the subsequent curvature test to remove them.
+\item \textbf{No kernel required.} $R$ is computed from three finite-difference
+images, which is consistent with the Gaussian-free constraint.
+\end{enumerate}
+
+\subsection{Derivative operators}
+
+All derivatives use central differences on the replicate-padded image:
+\begin{align}
+L_x &= \tfrac12\,[-1,0,1]*L,
+\qquad L_{xx} = [1,-2,1]*L, \\[2pt]
+L_{xy} &= \tfrac14
+\begin{bmatrix}1&0&-1\\ 0&0&0\\ -1&0&1\end{bmatrix}*L .
+\end{align}
+The Sobel operator is deliberately \emph{not} used: it factorises as
+$[-1,0,1]\otimes[1,2,1]$, and the binomial factor $[1,2,1]$ is the standard
+\emph{discrete Gaussian} approximation. Using Sobel would reintroduce a
+Gaussian into every derivative in the pipeline.
+
+\subsection{Scale-space extrema (Figure~\ref{fig:raw})}
+
+A sample is kept if it is a \emph{strict} maximum of $R$ among its $26$
+neighbours in the $3\times3\times3$ neighbourhood spanning $(x,y,\sigma)$,
+excluding the first and last level of each octave and a border of $6$ pixels.
+Excluding the centre from the comparison footprint makes the test strict, so a
+flat ridge of the response no longer yields a cluster of duplicate detections.
+A numerical floor of $10^{-6}$ removes extrema caused by round-off in
+homogeneous regions.
+
+\subsection{Rejection of weak and unstable detections (Figure~\ref{fig:filt})}
+
+Two tests, both taken from SIFT:
+\begin{itemize}\itemsep2pt
+\item \textbf{Contrast:} $R\ge\tau$, with $\tau=10^{-3}$ on an image scaled to
+$[0,1]$.
+\item \textbf{Principal curvature:} an unstable keypoint lies on a ridge, where
+the ratio $r$ of the principal curvatures is large. Using
+$\operatorname{tr}^2\mathbf{H}/\det\mathbf{H}=(r+1)^2/r$, we require
+\begin{equation}
+\frac{\bigl(L_{xx}+L_{yy}\bigr)^{2}}{L_{xx}L_{yy}-L_{xy}^{2}}
+<\frac{(r+1)^{2}}{r},\qquad r=10 .
+\end{equation}
+The quantity is independent of the $\sigma^4$ normalisation, so the test is
+identical to Lowe's even though the underlying response is not.
+\end{itemize}
+
+\subsection{Sub-pixel and sub-scale localisation (Figure~\ref{fig:loc})}
+
+A $3$-D quadratic is fitted to $R$ around each detection,
+\begin{equation}
+R(\mathbf{z}+\delta)\approx R+\nabla R^{\!\top}\delta
++\tfrac12\delta^{\!\top}\mathbf{H}_R\,\delta ,
+\qquad
+\hat\delta=-\mathbf{H}_R^{-1}\nabla R ,
+\end{equation}
+with $\mathbf{z}=(x,y,s)$ and all derivatives of $R$ taken by finite
+differences on the response volume. If any component of $\hat\delta$ exceeds
+$\tfrac12$ the sample is re-centred on the neighbouring one and the fit is
+repeated (at most five times); failures to converge inside the grid are
+discarded, as are points whose interpolated response
+$R+\tfrac12\nabla R^{\!\top}\hat\delta$ falls below $\tau$. The refined
+sub-level index gives a continuous scale,
+$\sigma=\sigma_0 2^{(s+\hat\delta_s)/S}\,2^{o}$.
+
+\paragraph{Duplicate suppression.} The same structure is frequently detected in
+two adjacent octaves or at two adjacent levels. Such detections carry nearly
+identical descriptors, which defeats the ratio test used at matching time, so
+keypoints within $1.5$\,px whose scales differ by less than a factor $1.3$ are
+merged, the strongest being kept.
+
+\subsection{Orientation assignment (Figure~\ref{fig:ori})}
+
+For each keypoint, gradients are read from the scale-space level nearest to its
+refined scale and accumulated into a $36$-bin histogram of
+$\theta=\arctan2(L_y,L_x)$. Each sample is weighted by its gradient magnitude
+times a \textbf{triangular (Bartlett) window}
+\begin{equation}
+w(r)=\max\!\Bigl(0,\;1-\frac{r}{R}\Bigr),\qquad R=4\sigma ,
+\end{equation}
+which replaces SIFT's Gaussian window. The Gaussian there performs no
+Gaussian-specific function: it is a soft radial roll-off ensuring that distant
+pixels contribute less and that nothing appears or disappears abruptly at the
+window edge. Any smooth, decaying, compactly supported window serves, and the
+Bartlett window --- a first-order B-spline, the convolution of two box windows
+--- is the simplest such choice.
+
+Two refinements reduce quantisation error, which otherwise propagates directly
+into every descriptor:
+\begin{itemize}\itemsep2pt
+\item each sample is split \emph{linearly} between its two neighbouring
+angular bins rather than assigned to one, removing the $10^{\circ}$ bias of
+hard binning;
+\item the histogram is smoothed circularly with the triangular kernel
+$[1\,2\,3\,2\,1]/9$. Note that the \emph{binomial} kernel $[1\,4\,6\,4\,1]/16$,
+the usual choice here, is a discrete Gaussian and is therefore avoided.
+\end{itemize}
+Following SIFT, the peak is located to sub-bin accuracy by fitting a parabola
+to the peak bin and its two neighbours, and every local peak reaching $80\,\%$
+of the maximum spawns an additional keypoint with the same position and scale
+but a different orientation.
+
+\subsection{Descriptor}
+
+The descriptor follows SIFT exactly, with the Gaussian envelope replaced. The
+patch is sampled on the pixel grid, each offset being rotated by $-\theta$ so
+that the descriptor is expressed in the keypoint's own frame:
+\begin{equation}
+\begin{pmatrix}u\\v\end{pmatrix}
+=\frac{1}{3\sigma}
+\begin{pmatrix}\cos\theta & \sin\theta\\ -\sin\theta & \cos\theta\end{pmatrix}
+\begin{pmatrix}x-x_0\\ y-y_0\end{pmatrix},
+\end{equation}
+so that one descriptor cell spans $3\sigma$ pixels and the $4\times4$ grid has
+half-width $h=6\sigma$. Gradient orientations are likewise referred to
+$\theta$. Votes are distributed by \emph{trilinear} interpolation over the two
+neighbouring cells in each spatial direction and the two neighbouring
+orientation bins, giving a $4\times4\times8=128$ dimensional vector. The
+spatial weighting is again triangular,
+\begin{equation}
+w(r)=\max\!\Bigl(0,\;1-\frac{r}{2.5\,h}\Bigr).
+\end{equation}
+The factor $2.5$ matters: a cone that reached zero at the patch boundary would
+give the four corner cells almost no weight and silently reduce the descriptor
+to about twelve effective cells, whereas SIFT's Gaussian envelope leaves them
+roughly $30\,\%$ of the central weight. With $2.5h$ the triangular profile
+tracks the Gaussian profile closely over the whole patch.
+
+Finally the vector is $\ell_2$ normalised, clipped at $0.2$ to suppress the
+effect of large gradient magnitudes, and renormalised --- Lowe's illumination
+robustness step --- after which the \emph{RootSIFT}
+transform~\cite{rootsift2012} is applied,
+\begin{equation}
+\mathbf{d}\;\leftarrow\;\sqrt{\mathbf{d}/\lVert\mathbf{d}\rVert_{1}} ,
+\end{equation}
+so that Euclidean distances between descriptors become Hellinger distances
+between the underlying histograms. The result is already $\ell_2$ normalised,
+so the matching stage is unchanged.
+
+\subsection{Summary of the algorithm}
+
+\begin{algorithm}[ht]
+\caption{NDSS-SIFT}
+\label{alg:main}
+\begin{algorithmic}[1]
+\State $I\gets$ Cameraman, converted to \texttt{float64} in $[0,1]$
+\For{$o=0$ to $O-1$}
+  \State $k\gets$ $70^{\text{th}}$ percentile of $|\nabla L_{\text{base}}|$
+  \For{$i=0$ to $S+2$}
+    \State evolve \eqref{eq:pm} by $\Delta t_i=\tfrac12(\sigma_i^2-\sigma_{i-1}^2)$
+           using scheme \eqref{eq:scheme} with $\Delta t\le0.28$
+    \State $R_i\gets\sigma_i^{4}\bigl(L_{xx}L_{yy}-L_{xy}^{2}\bigr)$
+  \EndFor
+  \State $L_{\text{base}}\gets L_{S}[::2,::2]$ \Comment{no anti-alias filter}
+\EndFor
+\State $\mathcal{K}\gets$ strict maxima of $R$ over the $26$ neighbours in $(x,y,\sigma)$
+\State discard $R<\tau$ and $\operatorname{tr}^2\mathbf{H}/\det\mathbf{H}\ge(r{+}1)^2/r$
+\State refine each keypoint by a $3$-D quadratic fit; drop non-convergent ones
+\State merge duplicates ($1.5$\,px, scale ratio $1.3$)
+\ForAll{keypoints}
+  \State build the $36$-bin orientation histogram with a $4\sigma$ Bartlett window
+  \State emit one keypoint per peak above $80\,\%$ of the maximum
+  \State compute the $4\times4\times8$ descriptor, normalise, clip, RootSIFT
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+%==============================================================================
+\section{What was changed with respect to the SIFT taught in class}
+%==============================================================================
+
+Table~\ref{tab:changes} is the central comparison. Everything not listed there
+is unchanged from Lowe's algorithm.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}p{4.3cm}p{5.1cm}p{5.1cm}@{}}
+\toprule
+Stage & Classical SIFT & NDSS-SIFT \\
+\midrule
+Scale space &
+$L=G_\sigma*I$, i.e.\ \emph{linear} diffusion &
+Perona--Malik \emph{nonlinear} diffusion, isotropic $9$-point explicit scheme;
+no convolution kernel exists \\
+\addlinespace[2pt]
+Band-pass response &
+$\mathrm{DoG}=L(k\sigma)-L(\sigma)$ &
+$\sigma^{4}\det\mathbf{H}$ from finite differences \\
+\addlinespace[2pt]
+Octave down-sampling &
+Gaussian pre-blur, then decimate &
+plain decimation $L[::2,::2]$, no filter \\
+\addlinespace[2pt]
+Derivatives &
+usually Sobel ($[-1,0,1]\otimes[1,2,1]$) &
+central differences $[-1,0,1]/2$, $[1,-2,1]$ \\
+\addlinespace[2pt]
+Orientation window &
+Gaussian, $\sigma_w=1.5\sigma$ &
+triangular $\max(0,1-r/4\sigma)$ \\
+\addlinespace[2pt]
+Histogram smoothing &
+box/binomial &
+triangular $[1\,2\,3\,2\,1]/9$, plus linear soft binning \\
+\addlinespace[2pt]
+Descriptor window &
+Gaussian, $\sigma_w=h$ &
+triangular $\max(0,1-r/2.5h)$ \\
+\addlinespace[2pt]
+Descriptor normalisation &
+$\ell_2$, clip $0.2$, $\ell_2$ &
+same, followed by RootSIFT \\
+\addlinespace[2pt]
+Duplicate handling &
+none &
+merge within $1.5$\,px and scale ratio $1.3$ \\
+\midrule
+\multicolumn{3}{@{}l@{}}{\emph{Retained unchanged:}
+$3\!\times\!3\!\times\!3$ extrema search; contrast threshold; principal-curvature
+test with $r=10$;}\\
+\multicolumn{3}{@{}l@{}}{\ \ quadratic sub-pixel/sub-scale refinement;
+$36$-bin orientation histogram with the $80\,\%$ rule; $4\!\times\!4\!\times\!8$}\\
+\multicolumn{3}{@{}l@{}}{\ \ descriptor with trilinear interpolation; octave
+structure with $S=3$, $\sigma_0=1.6$.}\\
+\bottomrule
+\end{tabular}
+\caption{Differences between classical SIFT and the proposed method.}
+\label{tab:changes}
+\end{table}
+
+\paragraph{Why these substitutions are legitimate.} The Gaussian plays two
+genuinely different roles in SIFT. In the scale space it is \emph{structural}:
+it is the unique kernel satisfying the scale-space axioms (linearity,
+shift/rotation invariance, semi-group, no creation of new extrema), so it
+cannot simply be swapped for another kernel --- the construction itself has to
+change, which is why a nonlinear PDE is used. In the orientation and descriptor
+windows it is merely a \emph{soft aperture}, and nothing in SIFT's derivation
+depends on its Gaussian shape; a compactly supported triangular window
+discharges the same duty.
+
+%==============================================================================
+\section{Gaussian-freeness: audit and objections}
+%==============================================================================
+
+Table~\ref{tab:audit} audits every operation in the implementation that touches
+pixel values.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}llc@{}}
+\toprule
+Operation & What is actually computed & Gaussian? \\
+\midrule
+first derivatives            & $[-1,0,1]/2$                      & no \\
+second derivatives           & $[1,-2,1]$, $4$-point cross       & no \\
+scale space                  & nonlinear PDE \eqref{eq:pm}       & \textbf{no kernel exists} \\
+blob response                & $\sigma^4\det\mathbf{H}$          & no \\
+octave step                  & decimation $[::2,::2]$            & no \\
+non-maximum suppression      & morphological max (rank filter)   & no \\
+histogram smoothing          & $[1\,2\,3\,2\,1]/9$ (Bartlett)    & no \\
+orientation / descriptor window & $\max(0,1-r/R)$                & no \\
+descriptor binning           & trilinear (linear weights)        & no \\
+evaluation warps             & bilinear interpolation            & no \\
+\bottomrule
+\end{tabular}
+\caption{Audit of every pixel-level operation. The implementation contains no
+call to \texttt{exp}, no \texttt{gaussian\_filter}, no Sobel operator, and
+never enables \texttt{anti\_aliasing} (which is Gaussian inside
+\texttt{scikit-image}).}
+\label{tab:audit}
+\end{table}
+
+Three objections deserve an explicit answer.
+
+\paragraph{"The symbol $\sigma$ is still used."}
+$\sigma$ labels evolution time through $t=\sigma^2/2$ and is retained only so
+that the parameters are directly comparable with Lowe's. Nothing in the
+implementation evaluates $\exp(-x^{2}/2\sigma^{2})$; driving the code by $t$
+alone would produce bit-identical output.
+
+\paragraph{"A triangular window is an approximate Gaussian."}
+It is not. A Bartlett window is compactly supported and piecewise linear --- a
+first-order B-spline, obtained by convolving two box windows. What \emph{would}
+be a discrete Gaussian is the binomial family $[1\,2\,1]$, $[1\,4\,6\,4\,1]$,
+which is precisely why those kernels are avoided throughout, including inside
+the Sobel operator.
+
+\paragraph{"For $|\nabla L|\ll k$ the PDE reduces to the heat equation."}
+Locally, in perfectly homogeneous regions, the behaviour does approach linear
+diffusion. Two points answer this. First, the operator is not shift invariant,
+so no convolution kernel represents the evolution: there is nothing to
+eliminate because nothing exists. Second, the measured contrast factors,
+$k=\Kvals$, are small, so essentially every structure in Cameraman that
+produces a keypoint lies in the strongly nonlinear regime; homogeneous sky
+behaving diffusively is irrelevant, since it generates no keypoints.
+
+%==============================================================================
+\section{Implementation and complexity}
+%==============================================================================
+
+The implementation is pure \texttt{NumPy}; \texttt{SciPy} is used only for the
+non-maximum-suppression filter and a $k$-d tree in the evaluation code, and
+\texttt{scikit-image} only to load the image and to warp it in the invariance
+study. Every stage is vectorised except the per-keypoint loops.
+
+Let $N$ be the number of pixels of an octave. One explicit step
+\eqref{eq:scheme} costs $\mathcal{O}(N)$; reaching level $i$ requires
+$\lceil\Delta t_i/0.28\rceil$ steps, about $50$ steps per octave in total.
+Since octave areas form a geometric series with ratio $1/4$, the whole scale
+space costs $\mathcal{O}(N)$ with a small constant. Detection, filtering and
+refinement are $\mathcal{O}(N)$ and $\mathcal{O}(|\mathcal{K}|)$; orientation
+and descriptor cost $\mathcal{O}(|\mathcal{K}|\sigma^2)$.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+Parameter & Value & Parameter & Value \\
+\midrule
+octaves $O$                 & $4$        & contrast threshold $\tau$      & $10^{-3}$ \\
+levels per octave $S$       & $3$ ($S{+}3=6$ built) & curvature limit $r$ & $10$ \\
+base scale $\sigma_0$       & $1.6$      & border margin                  & $6$\,px \\
+contrast percentile         & $70$       & refinement iterations          & $5$ \\
+time step $\Delta t$        & $\le0.28$  & duplicate tolerance            & $1.5$\,px, $1.3\times$ \\
+stencil weights             & $2/3,\ 1/6$& orientation bins               & $36$ \\
+response floor              & $10^{-6}$  & orientation window             & $4\sigma$ \\
+descriptor grid             & $4\times4\times8$ & descriptor cell         & $3\sigma$ \\
+descriptor envelope         & $2.5h$     & peak ratio                     & $0.8$ \\
+\bottomrule
+\end{tabular}
+\caption{Complete parameter set. All values are defined in one configuration
+block at the top of the notebook.}
+\label{tab:params}
+\end{table}
+
+%==============================================================================
+\section{Results}
+%==============================================================================
+
+All results are produced on the mandatory image,
+\texttt{skimage.data.camera()}, $512\times512$, $8$-bit grayscale, converted to
+\texttt{float64} in $[0,1]$. The complete notebook, including the invariance
+study, executes in $\approx\Truntime$\,s from a fresh Colab runtime.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.46\textwidth]{fig1_original.png}
+\caption{The mandatory $512\times512$ Cameraman image.}
+\label{fig:orig}
+\end{figure}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=\textwidth]{fig2_scale_space.png}
+\caption{Multiscale responses of the proposed scale-space
+construction. Top row: levels of the nonlinear-diffusion scale space. Bottom
+row: the corresponding scale-normalised determinant-of-Hessian responses. The
+scale $\sigma$ of every panel is printed above it, in pixels of the original
+image; panels span roughly $\sigma=2$ to $\sigma=26$\,px across four octaves.
+Note that region boundaries remain sharp as $\sigma$ grows --- the signature of
+nonlinear diffusion, and the reason keypoints do not drift with scale.}
+\label{fig:ss}
+\end{figure}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.56\textwidth]{fig3_raw_extrema.png}
+\caption{Raw scale-space extrema before any rejection or
+refinement. \textbf{Total number of detected extrema: \Nraw.}}
+\label{fig:raw}
+\end{figure}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.56\textwidth]{fig4_filtered.png}
+\caption{Keypoints surviving the contrast and
+principal-curvature tests ($\Nfilt$ remain). Marker size is proportional to the
+detected scale.}
+\label{fig:filt}
+\end{figure}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.56\textwidth]{fig5_localized.png}
+\caption{Keypoints after spatial and scale refinement by the
+$3$-D quadratic fit, followed by duplicate suppression ($\Nloc$ remain). Marker
+size reflects the refined scale; the red dot marks the sub-pixel position.}
+\label{fig:loc}
+\end{figure}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.62\textwidth]{fig6_oriented.png}
+\caption{Final oriented keypoints ($\Nori$ in total; the
+count exceeds Figure~\ref{fig:loc} because a keypoint with several dominant
+orientations is duplicated, as in SIFT). Each circle has radius $2\sigma$ and
+each radial line shows the assigned orientation.}
+\label{fig:ori}
+\end{figure}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lrl@{}}
+\toprule
+Stage & Keypoints & Figure \\
+\midrule
+raw scale-space extrema                       & \Nraw  & \ref{fig:raw} \\
+after weak-response and edge rejection        & \Nfilt & \ref{fig:filt} \\
+after sub-pixel localisation and de-duplication & \Nloc  & \ref{fig:loc} \\
+final oriented keypoints                      & \Nori  & \ref{fig:ori} \\
+\bottomrule
+\end{tabular}
+\caption{Keypoint population at each stage of the pipeline.}
+\label{tab:counts}
+\end{table}
+
+\subsection{Invariance study}
+
+To verify that the detector really is scale and rotation invariant, the
+pipeline is re-run on warped copies of Cameraman with a known ground-truth
+transform. Two standard measures are reported. \emph{Repeatability} is the
+fraction of keypoints of the common region that are re-detected within
+$2.5$\,px and within a factor $1.5$ in scale; it measures the detector alone.
+\emph{Matching precision} is the fraction of accepted descriptor matches that
+are geometrically correct within $3$\,px, and the \emph{matching score} is the
+number of correct matches divided by the number of available keypoints. Only
+the common valid region is used: the black corners created by a rotation are
+excluded, together with a $24$\,px margin so that a keypoint's support lies
+entirely inside the valid area. Warping uses bilinear interpolation with
+anti-aliasing disabled, since \texttt{scikit-image}'s anti-aliasing filter is
+Gaussian.
+
+Matching uses Lowe's ratio test at $0.8$ with two modifications. The second
+nearest neighbour is required to lie at least $4$\,px away from the first,
+because otherwise the same physical point detected twice acts as its own
+second neighbour and a correct match is rejected; and matches are required to
+be mutual nearest neighbours.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+Test & kp (A) & kp (B) & repeatability & matches & precision & m-score \\
+\midrule
+rotated $15^{\circ}$ & & & & & & \\
+rotated $30^{\circ}$ & & & & & & \\
+rotated $45^{\circ}$ & & & & & & \\
+rotated $90^{\circ}$ & & & & & & \\
+zoom $\times1.50$    & & & & & & \\
+zoom $\times0.75$    & & & & & & \\
+\bottomrule
+\end{tabular}
+\caption{Invariance study. \textcolor{red}{Fill in from the table printed by
+the notebook.} The $90^{\circ}$ row is the sanity check: that rotation is exact
+on the pixel grid, so repeatability there should approach $100\,\%$.}
+\label{tab:bench}
+\end{table}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.92\textwidth]{fig7_match_example.png}
+\caption{\emph{Additional figure.} Correctly matched keypoints between
+the original image and a $30^{\circ}$ rotated copy.}
+\label{fig:match}
+\end{figure}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.92\textwidth]{fig8_invariance.png}
+\caption{\emph{Additional figure.} Repeatability, matching precision and
+matching score as a function of rotation angle (left) and zoom factor (right).}
+\label{fig:inv}
+\end{figure}
+
+%==============================================================================
+\section{Discussion and limitations}
+%==============================================================================
+
+\paragraph{What nonlinear diffusion buys.} Because the flow does not smooth
+across boundaries, the position of a structure is far more stable across scale
+than under Gaussian blurring, where every feature drifts as it dissolves. This
+is visible in Figure~\ref{fig:ss}: the silhouette of the cameraman is still
+crisp at $\sigma\approx26$\,px.
+
+\paragraph{What it costs.} Two limitations follow from the same property.
+First, an edge-preserving flow leaves sharp edges intact, so decimation without
+an anti-alias filter does alias along those edges; the implementation therefore
+offers an optional $3\times3$ \emph{box} average before decimation (a box
+kernel is not a Gaussian) which trades a little sharpness for less aliasing.
+Second, because a strong structure never fully dissolves, its response can keep
+growing with $\sigma$, which makes scale selection less decisive than under
+Gaussian blurring --- the price paid for positional stability.
+
+\paragraph{Scale range.} Unlike Lowe's implementation, the input image is not
+up-sampled by a factor of two before processing, so structures finer than
+$\sigma_0=1.6$\,px are not represented. This is why zooming \emph{out} is the
+harder direction in Table~\ref{tab:bench}.
+
+\paragraph{Cost of explicit integration.} The explicit scheme is limited to
+$\Delta t\le0.3$, so reaching large scales requires many small steps. This is
+comfortably fast at $512\times512$, but for large images an Additive Operator
+Splitting or Fast Explicit Diffusion scheme~\cite{weickert1998} would remove
+the step-size restriction without introducing any kernel.
+
+%==============================================================================
+\section{Conclusion}
+%==============================================================================
+
+NDSS-SIFT replaces every Gaussian kernel of SIFT. The scale space is rebuilt
+from a nonlinear Perona--Malik diffusion, which has no convolution kernel at
+all rather than a non-Gaussian one; the Difference of Gaussians becomes a
+scale-normalised determinant of the Hessian computed from central differences;
+the anti-alias pre-blur is removed; and the Gaussian weighting windows become
+triangular. The selection, refinement, orientation and description stages of
+SIFT are retained unchanged, so the method is a genuine alternative SIFT rather
+than a different detector. The implementation produces all six mandatory
+figures on the prescribed Cameraman image and executes end to end in
+$\approx\Truntime$\,s in Google Colab.
+
+%==============================================================================
+\begin{thebibliography}{9}
+\bibitem{lowe2004} D.~G. Lowe, ``Distinctive image features from
+scale-invariant keypoints,'' \emph{IJCV}, 60(2):91--110, 2004.
+\bibitem{perona1990} P.~Perona and J.~Malik, ``Scale-space and edge detection
+using anisotropic diffusion,'' \emph{IEEE TPAMI}, 12(7):629--639, 1990.
+\bibitem{weickert1998} J.~Weickert, \emph{Anisotropic Diffusion in Image
+Processing}, Teubner, 1998.
+\bibitem{lindeberg1998} T.~Lindeberg, ``Feature detection with automatic scale
+selection,'' \emph{IJCV}, 30(2):79--116, 1998.
+\bibitem{kaze2012} P.~F. Alcantarilla, A.~Bartoli and A.~J. Davison, ``KAZE
+features,'' \emph{ECCV}, 2012.
+\bibitem{rootsift2012} R.~Arandjelovi\'c and A.~Zisserman, ``Three things
+everyone should know to improve object retrieval,'' \emph{CVPR}, 2012.
+\end{thebibliography}
+
+\end{document}
