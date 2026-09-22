@@ -1063,10 +1063,19 @@ def evaluate_transform(image, ref, tform, out_shape, scale_factor, label,
     if n_a == 0 or n_b == 0:
         return None
 
+    # Tolerances are stated in REFERENCE-image pixels and carried into the
+    # warped frame, otherwise a zoom silently changes the strictness of the
+    # test: a fixed 2.5 px in the warped frame is 1.67 reference px at 1.5x
+    # but 3.33 reference px at 0.75x, which alone makes zooming in look far
+    # worse than zooming out.
+    pos_tol = REPEAT_PIXEL_TOL * scale_factor
+    match_tol = MATCH_PIXEL_TOL * scale_factor
+    min_sep = MATCH_MIN_SEP * scale_factor
+
     tree = cKDTree(pb)
     n_corr = 0
     for p, s in zip(pa_m[keep_a], sa[keep_a] * scale_factor):
-        for j in tree.query_ball_point(p, REPEAT_PIXEL_TOL):
+        for j in tree.query_ball_point(p, pos_tol):
             if 1.0 / REPEAT_SCALE_TOL < sb[j] / s < REPEAT_SCALE_TOL:
                 n_corr += 1
                 break
@@ -1089,9 +1098,9 @@ def evaluate_transform(image, ref, tform, out_shape, scale_factor, label,
             db = np.array([kp["descriptor"] for kp in res["oriented"]])[kb]
             qa_m, qb = qa_m[ka], qb[kb]
 
-            best, accepted = match_descriptors(da, db, qb)
+            best, accepted = match_descriptors(da, db, qb, min_sep=min_sep)
             err = np.linalg.norm(qb[best] - qa_m, axis=1)
-            correct = accepted & (err < MATCH_PIXEL_TOL)
+            correct = accepted & (err < match_tol)
 
             stats["n_matches"] = int(accepted.sum())
             stats["n_correct"] = int(correct.sum())
